@@ -1,0 +1,7 @@
+pytesseract
+fastapi
+uvicorn
+python-multipart
+reportlab
+Pillow
+opencv-python-headless

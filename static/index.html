@@ -1,0 +1,118 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Legal Metrology Compliance Checker</title>
+<style>
+  body { font-family: -apple-system, sans-serif; max-width: 800px; margin: 40px auto; padding: 0 20px; color: #222; }
+  h1 { font-size: 22px; }
+  .upload-box { border: 2px dashed #ccc; border-radius: 8px; padding: 30px; text-align: center; margin: 20px 0; }
+  button { background: #185FA5; color: white; border: none; padding: 10px 20px; border-radius: 6px; cursor: pointer; font-size: 14px; }
+  button:disabled { background: #999; }
+  .status-pass { color: #0F6E56; font-weight: bold; }
+  .status-fail { color: #993C1D; font-weight: bold; }
+  table { width: 100%; border-collapse: collapse; margin-top: 12px; }
+  th, td { text-align: left; padding: 8px; border-bottom: 1px solid #eee; font-size: 14px; }
+  .field-pass { color: #0F6E56; }
+  .field-fail { color: #993C1D; }
+  #history-table { margin-top: 40px; }
+  .pdf-link { font-size: 13px; }
+</style>
+</head>
+<body>
+  <h1>Legal Metrology Compliance Checker</h1>
+  <p>Upload a photo of a packaged product label to check compliance with Rule 6 of the Legal Metrology (Packaged Commodities) Rules, 2011.</p>
+
+  <div class="upload-box">
+    <input type="file" id="fileInput" accept="image/*">
+    <br><br>
+    <button id="checkBtn" onclick="checkLabel()">Check compliance</button>
+  </div>
+
+  <div id="result"></div>
+
+  <div id="history-table">
+    <h2>Recent checks</h2>
+    <table id="historyTbl">
+      <thead><tr><th>Product</th><th>Time</th><th>Status</th><th>Report</th></tr></thead>
+      <tbody></tbody>
+    </table>
+  </div>
+
+<script>
+async function checkLabel() {
+  const input = document.getElementById('fileInput');
+  const btn = document.getElementById('checkBtn');
+  const resultDiv = document.getElementById('result');
+  if (!input.files.length) { alert('Choose an image first'); return; }
+
+  btn.disabled = true;
+  btn.textContent = 'Checking...';
+  resultDiv.innerHTML = '';
+
+  const formData = new FormData();
+  formData.append('file', input.files[0]);
+
+  try {
+    const res = await fetch('/check', { method: 'POST', body: formData });
+    const data = await res.json();
+    renderResult(data);
+    loadHistory();
+  } catch (e) {
+    resultDiv.innerHTML = '<p style="color:red">Error checking image. Is the server running?</p>';
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Check compliance';
+  }
+}
+
+function renderResult(data) {
+  const r = data.report;
+  const statusClass = r.overall_compliant ? 'status-pass' : 'status-fail';
+  const statusText = r.overall_compliant ? 'COMPLIANT' : 'NON-COMPLIANT';
+
+  let fieldsHtml = '<table><thead><tr><th>Declaration</th><th>Status</th><th>Detected text</th></tr></thead><tbody>';
+  for (const [key, f] of Object.entries(r.fields)) {
+    const cls = f.present ? 'field-pass' : 'field-fail';
+    const status = f.present ? 'Present' : 'Missing';
+    fieldsHtml += `<tr><td>${f.description}</td><td class="${cls}">${status}</td><td>${f.matched_text || '-'}</td></tr>`;
+  }
+  fieldsHtml += '</tbody></table>';
+
+  let notesHtml = '';
+  if (r.notes && r.notes.length) {
+    notesHtml = '<p><strong>Notes:</strong></p><ul>' + r.notes.map(n => `<li>${n}</li>`).join('') + '</ul>';
+  }
+  if (r.readability_flags && r.readability_flags.length) {
+    notesHtml += '<p><strong>Readability concerns:</strong></p><ul>' +
+      r.readability_flags.map(f => `<li>'${f.text}' - ${f.reason}</li>`).join('') + '</ul>';
+  }
+
+  document.getElementById('result').innerHTML = `
+    <h2 class="${statusClass}">${statusText}</h2>
+    ${fieldsHtml}
+    ${notesHtml}
+    <p class="pdf-link"><a href="/report/${data.id}/pdf" target="_blank">Download PDF report</a></p>
+  `;
+}
+
+async function loadHistory() {
+  const res = await fetch('/history');
+  const items = await res.json();
+  const tbody = document.querySelector('#historyTbl tbody');
+  tbody.innerHTML = items.map(item => `
+    <tr>
+      <td>${item.filename}</td>
+      <td>${item.timestamp}</td>
+      <td class="${item.overall_compliant ? 'status-pass' : 'status-fail'}">
+        ${item.overall_compliant ? 'Compliant' : 'Non-compliant'}
+      </td>
+      <td><a href="/report/${item.id}/pdf" target="_blank">PDF</a></td>
+    </tr>
+  `).join('');
+}
+
+loadHistory();
+</script>
+</body>
+</html>
