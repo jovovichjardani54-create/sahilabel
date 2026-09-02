@@ -1,0 +1,91 @@
+MULTILINGUAL OCR - PATCH INSTRUCTIONS FOR ocr_pipeline.py
+============================================================
+This is a text-diff guide, not a full file, since you should apply it
+to YOUR current ocr_pipeline.py (which already has the tesseract_cmd
+path fix and the None-check fix from earlier debugging).
+
+STEP 1 - Windows setup (one-time, outside the code):
+  Re-run the Tesseract installer (UB Mannheim build) and this time,
+  during install, check the boxes for "Hindi", "Tamil", and "Telugu"
+  under "Additional language data" - these are optional components
+  in the installer, unchecked by default.
+  (If you already installed without them: re-run the installer, choose
+  "Modify", and add the language packs then.)
+
+STEP 2 - Code change in extract_text():
+  Find your current function signature:
+
+      def extract_text(image_path: str, use_preprocessing: bool = True) -> dict:
+
+  Change it to add a new optional parameter with a safe default so
+  EVERY existing call site (main.py's /check endpoint) keeps working
+  with zero changes:
+
+      def extract_text(image_path: str, use_preprocessing: bool = True,
+                        lang: str = "eng") -> dict:
+
+STEP 3 - Pass lang through to both Tesseract calls inside the function:
+
+  Find:
+      full_text = pytesseract.image_to_string(pil_img)
+  Change to:
+      full_text = pytesseract.image_to_string(pil_img, lang=lang)
+
+  Find:
+      data = pytesseract.image_to_data(pil_img, output_type=pytesseract.Output.DICT)
+  Change to:
+      data = pytesseract.image_to_data(pil_img, lang=lang, output_type=pytesseract.Output.DICT)
+
+STEP 4 - Language codes to use:
+  English  -> "eng"
+  Hindi    -> "hin"
+  Tamil    -> "tam"
+  Telugu   -> "tel"
+  Multiple at once (auto-tries all, useful for bilingual labels which
+  are common in India) -> "eng+hin" or "eng+hin+tam+tel"
+
+STEP 5 - Wire it into main.py's /check endpoint (additive, backward
+compatible - defaults to "eng" if the frontend sends nothing):
+
+  Find:
+      @app.post("/check")
+      async def check_label(file: UploadFile = File(...)):
+
+  Change to:
+      @app.post("/check")
+      async def check_label(file: UploadFile = File(...), lang: str = Form("eng")):
+
+  (Add `Form` to your existing FastAPI import line:
+      from fastapi import FastAPI, UploadFile, File, HTTPException, Form
+  )
+
+  Then find:
+      ocr_result = extract_text(image_path)
+  Change to:
+      ocr_result = extract_text(image_path, lang=lang)
+
+STEP 6 - Frontend: add a language dropdown in index.html near the
+upload button:
+
+  <select id="langSelect">
+    <option value="eng">English</option>
+    <option value="eng+hin">English + Hindi</option>
+    <option value="eng+tam">English + Tamil</option>
+    <option value="eng+tel">English + Telugu</option>
+  </select>
+
+  In your existing checkLabel() function, find:
+      const formData = new FormData();
+      formData.append('file', input.files[0]);
+  Add one line right after:
+      formData.append('lang', document.getElementById('langSelect').value);
+
+  Do the same in camera.js's checkCameraCapture() if you want language
+  selection for camera captures too.
+
+WHY THIS IS SAFE:
+  Every parameter added has a default value ("eng" / Form("eng")), so
+  any code, test, or curl command that doesn't send a lang value keeps
+  behaving exactly as it did before this change. This is the same
+  pattern used throughout this update - additive parameters, not
+  modified signatures.

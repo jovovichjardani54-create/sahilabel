@@ -23,10 +23,34 @@
   <h1>Legal Metrology Compliance Checker</h1>
   <p>Upload a photo of a packaged product label to check compliance with Rule 6 of the Legal Metrology (Packaged Commodities) Rules, 2011.</p>
 
-  <div class="upload-box">
+  <div style="display:flex; gap:8px; margin-bottom:12px;">
+    <button onclick="showUploadMode('file')" id="modeFileBtn" style="font-weight:bold;">Upload file</button>
+    <button onclick="showUploadMode('camera')" id="modeCameraBtn">Use camera</button>
+  </div>
+
+  <div class="upload-box" id="fileUploadBox">
     <input type="file" id="fileInput" accept="image/*">
     <br><br>
+    <label style="font-size:13px;">
+      <input type="checkbox" id="geotagFile"> Attach my current location to this scan
+    </label>
+    <br><br>
     <button id="checkBtn" onclick="checkLabel()">Check compliance</button>
+  </div>
+
+  <div class="upload-box" id="cameraUploadBox" style="display:none;">
+    <video id="cameraVideo" style="display:none; width:100%; max-width:480px; border-radius:8px;" autoplay playsinline></video>
+    <img id="cameraPreview" style="display:none; width:100%; max-width:480px; border-radius:8px;">
+    <canvas id="cameraCanvas" style="display:none;"></canvas>
+    <br><br>
+    <label style="font-size:13px;">
+      <input type="checkbox" id="geotagCamera" checked> Attach my current location to this scan
+    </label>
+    <br><br>
+    <button id="startCameraBtn" onclick="startCamera()">Open camera</button>
+    <button id="captureBtn" style="display:none;" onclick="captureFrame()">Capture photo</button>
+    <button id="retakeBtn" style="display:none;" onclick="retakePhoto()">Retake</button>
+    <button id="cameraCheckBtn" style="display:none;" onclick="checkCameraCapture()">Check compliance</button>
   </div>
 
   <div id="result"></div>
@@ -40,6 +64,30 @@
   </div>
 
 <script>
+// ---- Geotagging helper (Feature: Geotagged Inspections) ----
+// Returns {latitude, longitude} or null if unavailable/denied. Never
+// blocks the scan - geotagging is best-effort, not required.
+function getLocationIfRequested(checkboxId) {
+  return new Promise((resolve) => {
+    const wantsGeo = document.getElementById(checkboxId)?.checked;
+    if (!wantsGeo || !navigator.geolocation) { resolve(null); return; }
+    navigator.geolocation.getCurrentPosition(
+      (pos) => resolve({ latitude: pos.coords.latitude, longitude: pos.coords.longitude }),
+      () => resolve(null),   // permission denied or unavailable - fail silently
+      { timeout: 5000 }
+    );
+  });
+}
+
+// ---- Camera mode toggle ----
+function showUploadMode(mode) {
+  document.getElementById('fileUploadBox').style.display = mode === 'file' ? 'block' : 'none';
+  document.getElementById('cameraUploadBox').style.display = mode === 'camera' ? 'block' : 'none';
+  document.getElementById('modeFileBtn').style.fontWeight = mode === 'file' ? 'bold' : 'normal';
+  document.getElementById('modeCameraBtn').style.fontWeight = mode === 'camera' ? 'bold' : 'normal';
+  if (mode === 'file' && typeof stopCamera === 'function') stopCamera();
+}
+
 async function checkLabel() {
   const input = document.getElementById('fileInput');
   const btn = document.getElementById('checkBtn');
@@ -52,6 +100,12 @@ async function checkLabel() {
 
   const formData = new FormData();
   formData.append('file', input.files[0]);
+
+  const loc = await getLocationIfRequested('geotagFile');
+  if (loc) {
+    formData.append('latitude', loc.latitude);
+    formData.append('longitude', loc.longitude);
+  }
 
   try {
     const res = await fetch('/check', { method: 'POST', body: formData });
@@ -90,10 +144,22 @@ function renderResult(data) {
 
   document.getElementById('result').innerHTML = `
     <h2 class="${statusClass}">${statusText}</h2>
+    <p><strong>Compliance score:</strong> <span id="scoreDisplay">loading...</span></p>
     ${fieldsHtml}
     ${notesHtml}
     <p class="pdf-link"><a href="/report/${data.id}/pdf" target="_blank">Download PDF report</a></p>
+    <p class="pdf-link"><a href="/annotated/${data.id}" target="_blank">View annotated image</a></p>
   `;
+
+  // Feature: Compliance Score - fetched separately since it's a plugin
+  // endpoint that doesn't change the shape of the existing /check response
+  fetch(`/score/${data.id}`).then(r => r.json()).then(scoreData => {
+    const el = document.getElementById('scoreDisplay');
+    if (el) el.textContent = `${scoreData.score}/100 (Grade ${scoreData.grade})`;
+  }).catch(() => {
+    const el = document.getElementById('scoreDisplay');
+    if (el) el.textContent = 'unavailable';
+  });
 }
 
 async function loadHistory() {
@@ -114,5 +180,6 @@ async function loadHistory() {
 
 loadHistory();
 </script>
+<script src="/static/camera.js"></script>
 </body>
 </html>

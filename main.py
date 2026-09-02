@@ -17,13 +17,19 @@ import os
 import uuid
 from datetime import datetime
 
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, UploadFile, File, HTTPException, Form
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from ocr_pipeline import extract_text
 from compliance_checker import check_fields
 from report_pdf import generate_pdf_report
+
+# --- PLUGIN IMPORTS (new, additive only) ---
+from plugins.scoring import compute_score
+from plugins.highlighting import annotate_image
+from plugins.explanations import build_full_explanation_set
+from plugins.dashboard_stats import compute_dashboard_stats
 
 app = FastAPI(title="Legal Metrology Compliance Checker")
 
@@ -36,9 +42,20 @@ os.makedirs(REPORT_DIR, exist_ok=True)
 # this is fine for a hackathon demo, but resets on server restart)
 HISTORY = []
 
+# --- PLUGIN STORAGE (new, additive only) ---
+# Kept separate from HISTORY/record dicts on purpose, so the existing
+# /history endpoint's response shape never changes. Plugins look up
+# what they need here by item_id.
+_PLUGIN_STORE = {}  # item_id -> {"image_path": str, "ocr_words": list}
+
 
 @app.post("/check")
-async def check_label(file: UploadFile = File(...)):
+async def check_label(
+    file: UploadFile = File(...),
+    latitude: float = Form(None),   # Feature: Geotagged Inspections
+    longitude: float = Form(None),  # optional - None if not sent/denied
+    inspector_id: str = Form(None), # optional - wire up once auth exists
+):
     content_type = file.content_type or ""
     if not content_type.startswith("image/"):
         raise HTTPException(400, "Please upload an image file")
@@ -54,22 +71,29 @@ async def check_label(file: UploadFile = File(...)):
     ocr_result = extract_text(image_path)
     report = check_fields(ocr_result)
 
-
     pdf_path = os.path.join(REPORT_DIR, f"{item_id}.pdf")
     generate_pdf_report(report, filename, pdf_path)
-
-    
-
-    
 
     record = {
         "id": item_id,
         "filename": filename,
         "timestamp": datetime.now().isoformat(timespec="seconds"),
         "overall_compliant": report["overall_compliant"],
+        "location": (
+            {"latitude": latitude, "longitude": longitude}
+            if latitude is not None and longitude is not None else None
+        ),
+        "inspector_id": inspector_id,
         "report": report,
     }
     HISTORY.append(record)
+
+    # PLUGIN: stash what scoring/highlighting/explanations will need,
+    # without touching `record` or HISTORY's shape at all
+    _PLUGIN_STORE[item_id] = {
+        "image_path": image_path,
+        "ocr_words": ocr_result["words"],
+    }
 
     return JSONResponse(record)
 
@@ -88,6 +112,53 @@ async def get_history():
     return [
         {k: v for k, v in r.items() if k != "report"} for r in reversed(HISTORY)
     ]
+
+
+# ============================================================
+# NEW PLUGIN ENDPOINTS (Features 2, 3, 4, 8)
+# None of these modify the routes above. Each is independently
+# removable by deleting its @app.get/@app.post block below.
+# ============================================================
+
+def _find_record(item_id: str) -> dict:
+    record = next((r for r in HISTORY if r["id"] == item_id), None)
+    if not record:
+        raise HTTPException(404, "Item not found")
+    return record
+
+
+@app.get("/score/{item_id}")
+async def get_score(item_id: str):
+    """Feature 3: Compliance Score"""
+    record = _find_record(item_id)
+    return compute_score(record["report"])
+
+
+@app.get("/annotated/{item_id}")
+async def get_annotated_image(item_id: str):
+    """Feature 2: Violation Highlighting - returns the annotated image file"""
+    record = _find_record(item_id)
+    plugin_data = _PLUGIN_STORE.get(item_id)
+    if not plugin_data:
+        raise HTTPException(404, "No stored OCR data for this item")
+
+    output_path = annotate_image(
+        plugin_data["image_path"], plugin_data["ocr_words"], record["report"], item_id
+    )
+    return FileResponse(output_path, media_type="image/png")
+
+
+@app.get("/explanations/{item_id}")
+async def get_explanations(item_id: str):
+    """Feature 8: AI Violation Explanation (template-based)"""
+    record = _find_record(item_id)
+    return build_full_explanation_set(record["report"])
+
+
+@app.get("/dashboard/stats")
+async def get_dashboard_stats():
+    """Feature 4: Advanced Dashboard - aggregate stats, existing /history untouched"""
+    return compute_dashboard_stats(HISTORY)
 
 
 @app.get("/", response_class=HTMLResponse)

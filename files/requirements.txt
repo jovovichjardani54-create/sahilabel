@@ -1,0 +1,14 @@
+# --- Optional additions (DB + Auth) - only needed if you adopt them ---
+sqlalchemy
+psycopg2-binary
+python-jose[cryptography]
+passlib[bcrypt]
+bcrypt==4.0.1
+
+pytesseract
+fastapi
+uvicorn
+python-multipart
+reportlab
+Pillow
+opencv-python-headless
