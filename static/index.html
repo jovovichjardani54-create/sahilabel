@@ -10,11 +10,13 @@
   button { background: #185FA5; color: white; border: none; padding: 10px 20px; border-radius: 6px; cursor: pointer; font-size: 14px; }
   button:disabled { background: #999; }
   .status-pass { color: #0F6E56; font-weight: bold; }
-  .status-fail { color: #993C1D; font-weight: bold; }
+  .status-review { color: #B45309; font-weight: bold; }
+  .status-violation, .status-fail { color: #993C1D; font-weight: bold; }
   table { width: 100%; border-collapse: collapse; margin-top: 12px; }
   th, td { text-align: left; padding: 8px; border-bottom: 1px solid #eee; font-size: 14px; }
   .field-pass { color: #0F6E56; }
-  .field-fail { color: #993C1D; }
+  .field-review { color: #B45309; }
+  .field-violation, .field-fail { color: #993C1D; }
   #history-table { margin-top: 40px; }
   .pdf-link { font-size: 13px; }
 </style>
@@ -122,14 +124,45 @@ async function checkLabel() {
 
 function renderResult(data) {
   const r = data.report;
-  const statusClass = r.overall_compliant ? 'status-pass' : 'status-fail';
-  const statusText = r.overall_compliant ? 'COMPLIANT' : 'NON-COMPLIANT';
+  const overallResult = r.overall_result || (r.overall_compliant ? 'PASS' : 'VIOLATION');
+  const statusClass = `status-${overallResult.toLowerCase()}`;
+  const declarationNames = {
+    manufacturer_or_packer: 'Manufacturer / packer details',
+    generic_product_name: 'Generic product name',
+    net_quantity: 'Net quantity',
+    mrp: 'Maximum retail price (MRP)',
+    manufacture_or_packing_date: 'Manufacture / packing date',
+    consumer_care: 'Consumer-care contact',
+  };
+  const statusPriority = { VIOLATION: 0, REVIEW: 1, PASS: 2 };
+  const safeText = (value, fallback = 'Not detected') =>
+    value === null || value === undefined || value === '' ? fallback : String(value);
 
-  let fieldsHtml = '<table><thead><tr><th>Declaration</th><th>Status</th><th>Detected text</th></tr></thead><tbody>';
-  for (const [key, f] of Object.entries(r.fields)) {
-    const cls = f.present ? 'field-pass' : 'field-fail';
-    const status = f.present ? 'Present' : 'Missing';
-    fieldsHtml += `<tr><td>${f.description}</td><td class="${cls}">${status}</td><td>${f.matched_text || '-'}</td></tr>`;
+  let decisions;
+  if (r.field_decisions) {
+    decisions = Object.values(r.field_decisions).sort(
+      (a, b) => (statusPriority[a.status] ?? 3) - (statusPriority[b.status] ?? 3)
+    );
+  } else {
+    decisions = Object.entries(r.fields || {}).map(([key, field]) => ({
+      field_key: key,
+      rule_id: '—',
+      status: field.present ? 'PASS' : 'VIOLATION',
+      extracted_value: field.matched_text,
+      confidence: null,
+      reason: field.present ? 'Present in the legacy report.' : 'Missing in the legacy report.',
+      declaration: field.description,
+    }));
+  }
+
+  let fieldsHtml = '<table><thead><tr><th>Declaration</th><th>Rule ID</th><th>Status</th><th>Extracted value</th><th>Confidence</th><th>Reason</th></tr></thead><tbody>';
+  for (const decision of decisions) {
+    const status = decision.status || 'REVIEW';
+    const cls = `field-${status.toLowerCase()}`;
+    const name = decision.declaration || declarationNames[decision.field_key] || decision.field_key;
+    const confidence = Number.isFinite(Number(decision.confidence)) ? `${Number(decision.confidence).toFixed(1)}%` : 'Not available';
+    const violationNote = status === 'VIOLATION' ? ' Potential violation pending inspector confirmation.' : '';
+    fieldsHtml += `<tr><td>${name}</td><td>${safeText(decision.rule_id, '—')}</td><td class="${cls}">${status}</td><td>${safeText(decision.extracted_value)}</td><td>${confidence}</td><td>${safeText(decision.reason, 'No reason provided.')}${violationNote}</td></tr>`;
   }
   fieldsHtml += '</tbody></table>';
 
@@ -143,7 +176,8 @@ function renderResult(data) {
   }
 
   document.getElementById('result').innerHTML = `
-    <h2 class="${statusClass}">${statusText}</h2>
+    <h2 class="${statusClass}">${overallResult}</h2>
+    <p class="${statusClass}">${safeText(r.decision_support_message, overallResult === 'VIOLATION' ? 'Potential violation pending inspector confirmation.' : 'Automated result requires review where indicated.')}</p>
     <p><strong>Compliance score:</strong> <span id="scoreDisplay">loading...</span></p>
     ${fieldsHtml}
     ${notesHtml}
@@ -170,8 +204,8 @@ async function loadHistory() {
     <tr>
       <td>${item.filename}</td>
       <td>${item.timestamp}</td>
-      <td class="${item.overall_compliant ? 'status-pass' : 'status-fail'}">
-        ${item.overall_compliant ? 'Compliant' : 'Non-compliant'}
+      <td class="status-${(item.overall_result || (item.overall_compliant ? 'PASS' : 'VIOLATION')).toLowerCase()}">
+        ${item.overall_result || (item.overall_compliant ? 'PASS' : 'VIOLATION')}
       </td>
       <td><a href="/report/${item.id}/pdf" target="_blank">PDF</a></td>
     </tr>

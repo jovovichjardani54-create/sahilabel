@@ -21,6 +21,17 @@ import numpy as np
 pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
 
 
+# Keep this pass deliberately bounded: three overlapping regions recover small
+# label print without turning one upload into dozens of OCR invocations.
+TILE_ROWS = 3
+TILE_COLUMNS = 1
+TILE_OVERLAP = 0.18
+TILE_SCALE = 2.0
+# Package labels contain dense but irregular blocks rather than one paragraph;
+# sparse-text segmentation keeps small adjacent declarations separate.
+TILE_OCR_CONFIG = "--psm 11"
+
+
 
 
 
@@ -41,7 +52,195 @@ def preprocess_image(image_path: str) -> np.ndarray:
     return thresh
 
 
-def extract_text(image_path: str, use_preprocessing: bool = True) -> dict:
+def enhance_image(image_path: str, scale: float = 2.0) -> tuple[np.ndarray, float]:
+    """Create a non-binary OCR variant while retaining the source scale."""
+    img = cv2.imread(image_path)
+    if img is None:
+        raise ValueError(
+            f"OpenCV could not read image at '{image_path}'. "
+            "The file may be missing, corrupted, or in an unsupported format."
+        )
+
+    enlarged = cv2.resize(img, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+    gray = cv2.cvtColor(enlarged, cv2.COLOR_BGR2GRAY)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    return clahe.apply(gray), scale
+
+
+def _ocr_words(
+    image: Image.Image,
+    scale: float = 1.0,
+    offset_left: int = 0,
+    offset_top: int = 0,
+    config: str | None = None,
+) -> list[dict]:
+    """Extract word data and map any resized-image boxes to source coordinates."""
+    options = {"output_type": pytesseract.Output.DICT}
+    if config:
+        options["config"] = config
+    data = pytesseract.image_to_data(image, **options)
+    words = []
+    for i in range(len(data["text"])):
+        text = data["text"][i].strip()
+        if not text:
+            continue
+
+        conf = float(data["conf"][i])
+        if conf < 0:
+            continue
+
+        words.append(
+            {
+                "text": text,
+                "conf": conf,
+                "left": offset_left + round(data["left"][i] / scale),
+                "top": offset_top + round(data["top"][i] / scale),
+                "width": max(1, round(data["width"][i] / scale)),
+                "height": max(1, round(data["height"][i] / scale)),
+            }
+        )
+    return words
+
+
+def _overlap_ratio(first: dict, second: dict) -> float:
+    """Return intersection over the smaller box area for OCR de-duplication."""
+    left = max(first["left"], second["left"])
+    top = max(first["top"], second["top"])
+    right = min(first["left"] + first["width"], second["left"] + second["width"])
+    bottom = min(first["top"] + first["height"], second["top"] + second["height"])
+    intersection = max(0, right - left) * max(0, bottom - top)
+    smallest_area = min(
+        first["width"] * first["height"], second["width"] * second["height"]
+    )
+    return intersection / smallest_area if smallest_area else 0.0
+
+
+def _text_detail(text: str) -> int:
+    """Prefer complete mixed tokens over shorter overlapping OCR fragments."""
+    alphanumeric = "".join(character for character in text if character.isalnum())
+    has_letters = any(character.isalpha() for character in alphanumeric)
+    has_digits = any(character.isdigit() for character in alphanumeric)
+    return len(alphanumeric) + int(has_letters and has_digits)
+
+
+def _merge_words(*word_sets: list[dict]) -> list[dict]:
+    """Keep the most confident reading when both passes identify one region."""
+    merged = []
+    for word_set in word_sets:
+        for candidate in word_set:
+            normalized = candidate["text"].casefold()
+            duplicate_index = next(
+                (
+                    index
+                    for index, existing in enumerate(merged)
+                    if _overlap_ratio(candidate, existing) >= 0.6
+                    or (
+                        normalized == existing["text"].casefold()
+                        and _overlap_ratio(candidate, existing) >= 0.2
+                    )
+                ),
+                None,
+            )
+            if duplicate_index is None:
+                merged.append(candidate)
+            elif (
+                candidate["conf"] > merged[duplicate_index]["conf"]
+                and _text_detail(candidate["text"])
+                >= _text_detail(merged[duplicate_index]["text"])
+            ):
+                merged[duplicate_index] = candidate
+    return sorted(merged, key=lambda word: (word["top"], word["left"]))
+
+
+def _tile_regions(
+    width: int,
+    height: int,
+    rows: int = TILE_ROWS,
+    columns: int = TILE_COLUMNS,
+    overlap: float = TILE_OVERLAP,
+) -> list[tuple[int, int, int, int]]:
+    """Return a small overlapping grid of source-coordinate tile regions."""
+    regions = []
+    base_width = max(1, int(np.ceil(width / columns)))
+    base_height = max(1, int(np.ceil(height / rows)))
+    overlap_x = int(round(base_width * overlap))
+    overlap_y = int(round(base_height * overlap))
+    for row in range(rows):
+        for column in range(columns):
+            cell_left = column * base_width
+            cell_top = row * base_height
+            cell_right = min(width, (column + 1) * base_width)
+            cell_bottom = min(height, (row + 1) * base_height)
+            left = max(0, cell_left - overlap_x)
+            top = max(0, cell_top - overlap_y)
+            right = min(width, cell_right + overlap_x)
+            bottom = min(height, cell_bottom + overlap_y)
+            if right > left and bottom > top:
+                regions.append((left, top, right - left, bottom - top))
+    return regions
+
+
+def _clamp_words(words: list[dict], width: int, height: int) -> list[dict]:
+    """Keep all returned boxes within the original uploaded image."""
+    clamped = []
+    for word in words:
+        left = max(0, min(int(word["left"]), width - 1))
+        top = max(0, min(int(word["top"]), height - 1))
+        right = min(width, max(left + 1, int(word["left"] + word["width"])))
+        bottom = min(height, max(top + 1, int(word["top"] + word["height"])))
+        if right <= left or bottom <= top:
+            continue
+        clamped.append({**word, "left": left, "top": top, "width": right - left, "height": bottom - top})
+    return clamped
+
+
+def _tiled_enhanced_words(image_path: str) -> list[dict]:
+    """OCR a bounded overlapping grid after non-destructive local enhancement."""
+    source = cv2.imread(image_path)
+    if source is None:
+        raise ValueError(f"OpenCV could not read image at '{image_path}'.")
+
+    height, width = source.shape[:2]
+    tiled_words = []
+    for left, top, tile_width, tile_height in _tile_regions(width, height):
+        tile = source[top : top + tile_height, left : left + tile_width]
+        enlarged = cv2.resize(tile, None, fx=TILE_SCALE, fy=TILE_SCALE, interpolation=cv2.INTER_CUBIC)
+        gray = cv2.cvtColor(enlarged, cv2.COLOR_BGR2GRAY)
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        enhanced_tile = clahe.apply(gray)
+        tiled_words.extend(
+            _ocr_words(
+                Image.fromarray(enhanced_tile),
+                scale=TILE_SCALE,
+                offset_left=left,
+                offset_top=top,
+                config=TILE_OCR_CONFIG,
+            )
+        )
+    return tiled_words
+
+
+def _words_to_text(words: list[dict]) -> str:
+    """Rebuild readable lines from source-coordinate word detections."""
+    lines = []
+    for word in words:
+        word_center = word["top"] + word["height"] / 2
+        if lines and abs(word_center - lines[-1]["center"]) <= max(8, word["height"]):
+            line = lines[-1]
+            line["words"].append(word)
+            line["center"] = sum(
+                item["top"] + item["height"] / 2 for item in line["words"]
+            ) / len(line["words"])
+        else:
+            lines.append({"center": word_center, "words": [word]})
+
+    return "\n".join(
+        " ".join(item["text"] for item in sorted(line["words"], key=lambda item: item["left"]))
+        for line in lines
+    )
+
+
+def extract_text(image_path: str, use_preprocessing: bool = False) -> dict:
     """
     Returns:
         {
@@ -53,36 +252,20 @@ def extract_text(image_path: str, use_preprocessing: bool = True) -> dict:
             ]
         }
     """
-    if use_preprocessing:
-        processed = preprocess_image(image_path)
-        pil_img = Image.fromarray(processed)
-    else:
-        pil_img = Image.open(image_path)
+    # Retain the public argument for compatibility. Both passes deliberately
+    # avoid adaptive thresholding so coloured labels keep their faint text.
+    original_image = Image.open(image_path)
+    original_words = _ocr_words(original_image)
 
-    full_text = pytesseract.image_to_string(pil_img)
+    enhanced_image, scale = enhance_image(image_path)
+    enhanced_words = _ocr_words(Image.fromarray(enhanced_image), scale=scale)
+    tiled_words = _tiled_enhanced_words(image_path)
 
-    data = pytesseract.image_to_data(pil_img, output_type=pytesseract.Output.DICT)
-
-    words = []
-    for i in range(len(data["text"])):
-        text = data["text"][i].strip()
-        if not text:
-            continue
-        conf = float(data["conf"][i])
-        if conf < 0:  # -1 means no confidence value (non-text region)
-            continue
-        words.append(
-            {
-                "text": text,
-                "conf": conf,
-                "left": data["left"][i],
-                "top": data["top"][i],
-                "width": data["width"][i],
-                "height": data["height"][i],
-            }
-        )
-
-    return {"full_text": full_text, "words": words}
+    words = _clamp_words(
+        _merge_words(original_words, enhanced_words, tiled_words),
+        *original_image.size,
+    )
+    return {"full_text": _words_to_text(words), "words": words}
 
 
 if __name__ == "__main__":

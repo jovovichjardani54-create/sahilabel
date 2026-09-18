@@ -16,7 +16,8 @@ Produces a structured compliance report:
     }
 """
 
-from rules_config import MANDATORY_FIELDS, QUALIFYING_WORDS
+from field_extractor import FOUND, NOT_FOUND, UNCERTAIN, extract_fields
+from rules_config import MANDATORY_FIELDS
 
 # ---- Font-size / readability heuristic ----
 # NOTE: This is a RELATIVE heuristic, not the exact Rule 8 mm thresholds.
@@ -27,42 +28,70 @@ READABILITY_RATIO_THRESHOLD = 0.35  # a field's text height must be at
 # least 35% of the largest text height on the label, else flagged
 
 
-def check_fields(ocr_result: dict) -> dict:
-    full_text = ocr_result["full_text"]
-    words = ocr_result["words"]
+FIELD_MAPPING = {
+    "manufacturer_or_packer": ("manufacturer_info", "Rule 6(1)(a)"),
+    "generic_product_name": ("product_name", "Rule 6(1)(b)"),
+    "net_quantity": ("net_quantity", "Rule 6(1)(c)"),
+    "mrp": ("mrp", "Rule 6(1)(e)"),
+    "manufacture_or_packing_date": ("mfg_date", "Rule 6(1)(d)"),
+    "consumer_care": ("customer_care", "Rule 6(2)"),
+}
 
-    field_results = {}
-    for field_key, field_def in MANDATORY_FIELDS.items():
-        match = field_def["pattern"].search(full_text)
-        field_results[field_key] = {
-            "present": bool(match),
-            "matched_text": match.group(0) if match else None,
-            "description": field_def["description"],
-            "severity": field_def["severity"],
+
+def _has_sufficient_ocr_quality(ocr_result: dict) -> bool:
+    """A conservative quality gate: an OCR failure can never prove absence."""
+    words = ocr_result.get("words", [])
+    confidences = [float(word.get("conf", -1)) for word in words if float(word.get("conf", -1)) >= 0]
+    return bool(confidences) and sum(confidences) / len(confidences) >= 60.0
+
+
+def _decision_for(extracted: dict, package_sides_complete: bool, ocr_quality_sufficient: bool) -> tuple[str, str]:
+    if extracted["status"] == FOUND:
+        return "PASS", extracted["reason"]
+    if extracted["status"] == UNCERTAIN:
+        return "REVIEW", f"{extracted['reason']} Inspector confirmation is required."
+    if not package_sides_complete:
+        return "REVIEW", "Declaration was not found, but package-side coverage is incomplete; it may appear on another side."
+    if not ocr_quality_sufficient:
+        return "REVIEW", "Declaration was not found, but OCR/image quality is insufficient to confirm an absence."
+    return "VIOLATION", "Potential violation pending inspector confirmation: declaration was not found after complete package coverage and sufficient OCR quality."
+
+
+def check_fields(ocr_result: dict, package_sides_complete: bool = False,
+                 ocr_quality_sufficient: bool | None = None) -> dict:
+    """Assess structured OCR evidence as decision support, not a legal finding."""
+    words = ocr_result.get("words", [])
+    quality = _has_sufficient_ocr_quality(ocr_result) if ocr_quality_sufficient is None else ocr_quality_sufficient
+    extracted_fields = extract_fields(ocr_result)
+    decisions, legacy_fields = {}, {}
+    for field_key, extracted in extracted_fields.items():
+        legacy_key, rule_id = FIELD_MAPPING[field_key]
+        status, reason = _decision_for(extracted, package_sides_complete, quality)
+        decisions[field_key] = {
+            "field_key": field_key, "rule_id": rule_id, "status": status,
+            "extracted_value": extracted["value"], "confidence": extracted["confidence"],
+            "evidence_text": extracted["evidence_text"], "bbox": extracted["bbox"],
+            "reason": reason,
+        }
+        definition = MANDATORY_FIELDS[legacy_key]
+        legacy_fields[legacy_key] = {
+            "present": status == "PASS", "matched_text": extracted["value"],
+            "description": definition["description"], "severity": definition["severity"],
         }
 
-    # Explanation I check: manufacturer info present WITHOUT a qualifying word
-    notes = []
-    if field_results["manufacturer_info"]["present"]:
-        if not QUALIFYING_WORDS.search(full_text):
-            notes.append(
-                "Name/address found without a qualifying word "
-                "('Mfd by'/'Packed by'/etc). Per Explanation I of Rule 6(1)(a), "
-                "this is presumed to be the manufacturer's address - flagging "
-                "for manual review."
-            )
-
+    statuses = [decision["status"] for decision in decisions.values()]
+    overall_result = "VIOLATION" if "VIOLATION" in statuses else "REVIEW" if "REVIEW" in statuses else "PASS"
     readability_flags = _check_readability(words)
-
-    overall_compliant = all(
-        f["present"] for f in field_results.values() if f["severity"] == "critical"
-    ) and not readability_flags
-
+    notes = ["Decision support only: any potential violation requires inspector confirmation."]
+    if not package_sides_complete:
+        notes.append("Package-side coverage is incomplete by default for the single-image workflow.")
+    if readability_flags:
+        notes.append("Experimental readability observations are review notes only and do not create legal violations.")
     return {
-        "overall_compliant": overall_compliant,
-        "fields": field_results,
-        "readability_flags": readability_flags,
-        "notes": notes,
+        "overall_compliant": overall_result == "PASS", "overall_result": overall_result,
+        "decision_support_message": "Potential violation pending inspector confirmation." if overall_result == "VIOLATION" else "Inspector review is required." if overall_result == "REVIEW" else "All extracted declarations passed automated checks.",
+        "field_decisions": decisions, "fields": legacy_fields,
+        "readability_flags": readability_flags, "notes": notes,
     }
 
 
@@ -114,15 +143,21 @@ def print_report(report: dict):
     print("=" * 60)
     print("COMPLIANCE REPORT")
     print("=" * 60)
-    status = "COMPLIANT ✅" if report["overall_compliant"] else "NON-COMPLIANT ❌"
+    status = report.get("overall_result", "PASS" if report["overall_compliant"] else "NON-COMPLIANT")
     print(f"Overall status: {status}\n")
 
     print("Field-by-field check:")
-    for key, res in report["fields"].items():
-        mark = "✅" if res["present"] else "❌"
-        print(f"  {mark} {res['description']}")
-        if res["present"]:
-            print(f"      -> matched: '{res['matched_text']}'")
+    if "field_decisions" in report:
+        for decision in report["field_decisions"].values():
+            print(f"  {decision['status']} {decision['field_key']} ({decision['rule_id']})")
+            print(f"      -> value: '{decision['extracted_value']}'")
+            print(f"      -> {decision['reason']}")
+    else:
+        for key, res in report["fields"].items():
+            mark = "✅" if res["present"] else "❌"
+            print(f"  {mark} {res['description']}")
+            if res["present"]:
+                print(f"      -> matched: '{res['matched_text']}'")
 
     if report["readability_flags"]:
         print("\n⚠️  Readability concerns:")

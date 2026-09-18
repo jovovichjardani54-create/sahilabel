@@ -71,14 +71,24 @@ async def check_label(
     ocr_result = extract_text(image_path)
     report = check_fields(ocr_result)
 
+    # Generate evidence once from the already-computed OCR/report data so the
+    # PDF and /annotated endpoint reuse the same decision-specific image.
+    try:
+        annotated_image_path = annotate_image(image_path, ocr_result["words"], report, item_id)
+    except Exception:
+        annotated_image_path = None
+
     pdf_path = os.path.join(REPORT_DIR, f"{item_id}.pdf")
-    generate_pdf_report(report, filename, pdf_path)
+    generate_pdf_report(report, filename, pdf_path, annotated_image_path)
 
     record = {
         "id": item_id,
         "filename": filename,
         "timestamp": datetime.now().isoformat(timespec="seconds"),
         "overall_compliant": report["overall_compliant"],
+        "overall_result": report.get(
+            "overall_result", "PASS" if report["overall_compliant"] else "VIOLATION"
+        ),
         "location": (
             {"latitude": latitude, "longitude": longitude}
             if latitude is not None and longitude is not None else None
@@ -93,6 +103,7 @@ async def check_label(
     _PLUGIN_STORE[item_id] = {
         "image_path": image_path,
         "ocr_words": ocr_result["words"],
+        "annotated_image_path": annotated_image_path,
     }
 
     return JSONResponse(record)
@@ -142,9 +153,11 @@ async def get_annotated_image(item_id: str):
     if not plugin_data:
         raise HTTPException(404, "No stored OCR data for this item")
 
-    output_path = annotate_image(
-        plugin_data["image_path"], plugin_data["ocr_words"], record["report"], item_id
-    )
+    output_path = plugin_data.get("annotated_image_path")
+    if not output_path or not os.path.exists(output_path):
+        output_path = annotate_image(
+            plugin_data["image_path"], plugin_data["ocr_words"], record["report"], item_id
+        )
     return FileResponse(output_path, media_type="image/png")
 
 

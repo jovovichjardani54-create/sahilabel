@@ -1,0 +1,13 @@
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.pyo
+.vs/
+.vscode/
+reports/
+annotated/
+uploads/
+.env
+*.log
+test_label.jpg.jpeg
