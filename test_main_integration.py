@@ -149,6 +149,10 @@ class MainIntegrationTests(unittest.TestCase):
         extract_text.assert_not_called()
 
         item_id = record["id"]
+        score = self.client.get(f"/score/{item_id}").json()
+        self.assertTrue(score["pending_review"])
+        self.assertIsNone(score["score"])
+        self.assertIsNone(score["grade"])
         confirmed = self.client.post(
             f"/inspector-reviews/{item_id}/confirm",
             json={"inspector_id": "insp-1", "reviewer_name": "Asha"},
@@ -177,6 +181,22 @@ class MainIntegrationTests(unittest.TestCase):
         )
         self.assertEqual(overridden.status_code, 200, overridden.text)
         self.assertEqual(overridden.json()["inspector_decision"], "OVERRIDDEN")
+
+    def test_html_dashboard_and_camera_ui_keep_json_analytics_available(self):
+        index = self.client.get("/")
+        dashboard = self.client.get("/analytics")
+        camera_script = self.client.get("/static/camera.js")
+
+        self.assertEqual(index.status_code, 200)
+        self.assertIn('data-camera-open="front"', index.text)
+        self.assertIn("Inspector review", index.text)
+        self.assertIn("Compliance score:</strong> Pending review", index.text)
+        self.assertEqual(dashboard.status_code, 200)
+        self.assertIn("Inspection analytics", dashboard.text)
+        self.assertIn("/analytics/history/analytics", dashboard.text)
+        self.assertEqual(camera_script.status_code, 200)
+        self.assertIn("navigator.mediaDevices.getUserMedia", camera_script.text)
+        self.assertEqual(self.client.get("/analytics/history/analytics").status_code, 200)
 
 
 if __name__ == "__main__":

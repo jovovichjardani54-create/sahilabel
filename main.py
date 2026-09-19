@@ -103,6 +103,7 @@ async def check_label(
     latitude: float = Form(None),   # Feature: Geotagged Inspections
     longitude: float = Form(None),  # optional - None if not sent/denied
     inspector_id: str = Form(None), # optional - wire up once auth exists
+    reviewer_name: str = Form(None),
 ):
     uploads = files if files else ([file] if file is not None else [])
     if not uploads:
@@ -196,11 +197,12 @@ async def check_label(
         },
         "report": report,
     }
-    if report["overall_result"] == "REVIEW" and inspector_id:
+    if report["overall_result"] == "REVIEW" and (inspector_id or reviewer_name):
         record["inspector_review"] = create_pending_review(
             item_id,
             report["overall_result"],
             inspector_id=inspector_id,
+            reviewer_name=reviewer_name,
         )
     if annotated_image_paths:
         record["annotated_evidence"] = {
@@ -375,9 +377,16 @@ async def get_dashboard_stats():
     return dashboard
 
 
+@app.get("/analytics", response_class=HTMLResponse)
+async def analytics_dashboard():
+    """Serve a local HTML dashboard while preserving the JSON analytics APIs."""
+    with open("static/analytics.html", "r", encoding="utf-8") as dashboard_file:
+        return dashboard_file.read()
+
+
 @app.get("/", response_class=HTMLResponse)
 async def index():
-    with open("static/index.html", "r") as f:
+    with open("static/index.html", "r", encoding="utf-8") as f:
         return f.read()
 
 

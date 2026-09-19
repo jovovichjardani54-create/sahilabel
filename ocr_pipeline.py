@@ -13,6 +13,8 @@ Team notes:
   as long as you keep returning the same dict shape from extract_text().
 """
 
+from typing import Any
+
 from PIL import Image
 import pytesseract
 import cv2
@@ -32,6 +34,14 @@ TILE_SCALE = 2.0
 # Package labels contain dense but irregular blocks rather than one paragraph;
 # sparse-text segmentation keeps small adjacent declarations separate.
 TILE_OCR_CONFIG = "--psm 11"
+
+# Paddle is intentionally optional.  The production environment currently
+# runs Python 3.14, for which the supported Paddle wheels are unavailable.
+# Keeping this import and model construction lazy lets a supported deployment
+# use Paddle as the primary engine without making app startup or Tesseract
+# fallback depend on it.
+_PADDLE_MODEL: Any | None = None
+_PADDLE_INITIALIZED = False
 
 
 
@@ -242,6 +252,122 @@ def _words_to_text(words: list[dict]) -> str:
     )
 
 
+def _get_paddle_model() -> Any | None:
+    """Create one optional PaddleOCR model on first eligible OCR request.
+
+    Importing PaddleOCR or constructing its model is deliberately deferred:
+    quality review must finish first, and the API must remain usable when the
+    optional dependency is absent.  A process restart is required to retry a
+    failed optional initialisation, which avoids repeated imports/download
+    attempts for every uploaded image.
+    """
+    global _PADDLE_INITIALIZED, _PADDLE_MODEL
+    if _PADDLE_INITIALIZED:
+        return _PADDLE_MODEL
+
+    _PADDLE_INITIALIZED = True
+    try:
+        from paddleocr import PaddleOCR
+
+        _PADDLE_MODEL = PaddleOCR(lang="en")
+    except Exception:
+        # Paddle is an enhancement, not an availability requirement.  The
+        # caller will use the existing Tesseract pipeline instead.
+        _PADDLE_MODEL = None
+    return _PADDLE_MODEL
+
+
+def _paddle_word(item: Any, image_width: int, image_height: int) -> dict | None:
+    """Convert PaddleOCR's polygon/result pair to the public word contract."""
+    if not isinstance(item, (list, tuple)) or len(item) < 2:
+        return None
+    polygon, recognition = item[0], item[1]
+    if not isinstance(polygon, (list, tuple)) or not isinstance(recognition, (list, tuple)):
+        return None
+    if len(recognition) < 2 or not isinstance(recognition[0], str):
+        return None
+    try:
+        points = [(float(point[0]), float(point[1])) for point in polygon if len(point) >= 2]
+        if not points:
+            return None
+        text = recognition[0].strip()
+        if not text:
+            return None
+        confidence = float(recognition[1])
+    except (TypeError, ValueError, IndexError):
+        return None
+
+    left = int(min(point[0] for point in points))
+    top = int(min(point[1] for point in points))
+    right = int(max(point[0] for point in points))
+    bottom = int(max(point[1] for point in points))
+    # Paddle exposes a 0..1 confidence while the existing contract uses
+    # Tesseract's 0..100 scale.
+    if confidence <= 1:
+        confidence *= 100
+    return {
+        "text": text,
+        "conf": confidence,
+        "left": left,
+        "top": top,
+        "width": max(1, right - left),
+        "height": max(1, bottom - top),
+    }
+
+
+def _paddle_result_words(result: Any, image_width: int, image_height: int) -> list[dict]:
+    """Extract recognized text lines from Paddle's documented ``ocr`` result."""
+    if not isinstance(result, (list, tuple)):
+        return []
+    # The common PaddleOCR result is a list of pages, each a list of
+    # ``[polygon, (text, confidence)]`` records.  Flatten pages only; never
+    # merge them with a second engine's output.
+    pages = result
+    if pages and isinstance(pages[0], (list, tuple)) and pages[0] and _paddle_word(
+        pages[0], image_width, image_height
+    ):
+        pages = [pages]
+
+    words = []
+    for page in pages:
+        if not isinstance(page, (list, tuple)):
+            continue
+        for item in page:
+            word = _paddle_word(item, image_width, image_height)
+            if word is not None:
+                words.append(word)
+    return _clamp_words(words, image_width, image_height)
+
+
+def _paddle_words(image_path: str) -> list[dict]:
+    """Run the primary provider, returning no words when it is unavailable."""
+    model = _get_paddle_model()
+    if model is None:
+        return []
+    try:
+        with Image.open(image_path) as source:
+            width, height = source.size
+        result = model.ocr(image_path, cls=False)
+        return _paddle_result_words(result, width, height)
+    except Exception:
+        return []
+
+
+def _tesseract_words(image_path: str) -> list[dict]:
+    """Run the established Tesseract flow as a single-provider fallback."""
+    original_image = Image.open(image_path)
+    original_words = _ocr_words(original_image)
+
+    enhanced_image, scale = enhance_image(image_path)
+    enhanced_words = _ocr_words(Image.fromarray(enhanced_image), scale=scale)
+    tiled_words = _tiled_enhanced_words(image_path)
+
+    return _clamp_words(
+        _merge_words(original_words, enhanced_words, tiled_words),
+        *original_image.size,
+    )
+
+
 def extract_text(image_path: str, use_preprocessing: bool = False) -> dict:
     """
     Returns:
@@ -260,19 +386,13 @@ def extract_text(image_path: str, use_preprocessing: bool = False) -> dict:
     if quality["recommendation"] != "PROCEED":
         return {"full_text": "", "words": []}
 
-    # Retain the public argument for compatibility. Both passes deliberately
-    # avoid adaptive thresholding so coloured labels keep their faint text.
-    original_image = Image.open(image_path)
-    original_words = _ocr_words(original_image)
-
-    enhanced_image, scale = enhance_image(image_path)
-    enhanced_words = _ocr_words(Image.fromarray(enhanced_image), scale=scale)
-    tiled_words = _tiled_enhanced_words(image_path)
-
-    words = _clamp_words(
-        _merge_words(original_words, enhanced_words, tiled_words),
-        *original_image.size,
-    )
+    # Paddle is primary when it is available and produces usable evidence.
+    # Tesseract is called only when Paddle is unavailable, fails, or returns
+    # no words; blending provider output would duplicate text and corrupt the
+    # source-coordinate evidence contract.
+    words = _paddle_words(image_path)
+    if not words:
+        words = _tesseract_words(image_path)
     return {"full_text": _words_to_text(words), "words": words}
 
 

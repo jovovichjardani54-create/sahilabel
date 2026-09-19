@@ -18,7 +18,7 @@
   .slot-state { color: #64748b; font-size: 12px; font-weight: 500; letter-spacing: normal; }
   .preview { display: none; width: 100%; height: 150px; object-fit: contain; background: #f1f5f9; border-radius: 7px; }
   .slot-empty { color: #64748b; min-height: 150px; display: grid; place-items: center; text-align: center; font-size: 13px; }
-  .slot-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: auto; }
+  .slot-actions { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; margin-top: auto; }
   button, .file-button { background: #185FA5; color: white; border: 0; padding: 10px 14px; border-radius: 6px; cursor: pointer; font-size: 14px; text-align: center; line-height: 1.2; }
   .file-button { display: block; } .file-button.secondary, button.secondary { background: #e2e8f0; color: #1e293b; }
   button:disabled { background: #94a3b8; cursor: wait; } .file-input { position: absolute; width: 1px; height: 1px; opacity: 0; pointer-events: none; }
@@ -35,33 +35,47 @@
   table { width: 100%; border-collapse: collapse; margin-top: 12px; } th, td { text-align: left; padding: 8px; border-bottom: 1px solid #eee; font-size: 14px; vertical-align: top; }
   .field-pass { color: #0F6E56; } .field-review { color: #B45309; } .field-violation, .field-fail { color: #993C1D; }
   .pdf-link { font-size: 13px; }
+  .top-links { float: right; font-size: 14px; margin-top: 8px; }
+  .top-links a { color: #185FA5; }
+  .inspector-panel { border-left: 4px solid #b45309; background: #fffbeb; border-radius: 6px; padding: 14px; margin: 16px 0; }
+  .inspector-panel h3 { margin: 0 0 8px; } .inspector-panel p { margin: 6px 0; }
+  .inspector-fields { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; margin-top: 12px; }
+  input[type="text"], textarea { border: 1px solid #cbd5e1; border-radius: 6px; padding: 9px; font: inherit; width: 100%; box-sizing: border-box; }
+  .review-actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 10px; }
+  dialog { border: 0; border-radius: 12px; width: min(640px, calc(100% - 32px)); padding: 20px; box-shadow: 0 20px 50px rgba(15, 23, 42, .32); }
+  dialog::backdrop { background: rgba(15, 23, 42, .58); }
+  #cameraVideo { background: #0f172a; width: 100%; max-height: 60vh; border-radius: 8px; }
+  #cameraMessage { color: #b45309; min-height: 20px; } .camera-actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 12px; }
   @media (max-width: 700px) { body { margin: 20px auto; } .image-slots { grid-template-columns: 1fr; } .image-slot { min-height: 0; } .preview, .slot-empty { height: 180px; } table { display: block; overflow-x: auto; } }
 </style>
 </head>
 <body>
+  <div class="top-links"><a href="/analytics">Analytics dashboard</a></div>
   <h1>Legal Metrology Compliance Checker</h1>
   <p class="intro">Capture or upload product-label photos to check Rule 6 declarations. Add the front image first; back and side images are optional supporting views.</p>
   <section class="capture-panel" aria-labelledby="capture-heading">
     <h2 id="capture-heading">Product images</h2>
-    <p class="capture-help">Use <strong>Upload</strong> to choose an existing image, or <strong>Camera</strong> to open a mobile camera. Each image is clearly labelled before it is checked.</p>
+    <p class="capture-help">Use <strong>Upload</strong> for an existing image, <strong>Camera</strong> for a live browser preview, or <strong>Mobile capture</strong> where the device picker is preferred. Each image is labelled before it is checked.</p>
     <div class="image-slots">
-      <article class="image-slot" data-label="front" id="slot-front"><div class="slot-heading"><span>FRONT</span><span class="slot-state" id="state-front">No image</span></div><img class="preview" id="preview-front" alt="Front image preview"><div class="slot-empty" id="empty-front">Add the primary label image</div><input class="file-input" type="file" id="upload-front" accept="image/*" data-label="front"><input class="file-input" type="file" id="camera-front" accept="image/*" capture="environment" data-label="front"><div class="slot-actions"><label class="file-button secondary" for="upload-front">Upload</label><label class="file-button camera-label" for="camera-front">Camera</label></div><button class="remove-button" type="button" data-remove="front">Remove image</button></article>
-      <article class="image-slot" data-label="back" id="slot-back"><div class="slot-heading"><span>BACK</span><span class="slot-state" id="state-back">Optional</span></div><img class="preview" id="preview-back" alt="Back image preview"><div class="slot-empty" id="empty-back">Add supporting label details</div><input class="file-input" type="file" id="upload-back" accept="image/*" data-label="back"><input class="file-input" type="file" id="camera-back" accept="image/*" capture="environment" data-label="back"><div class="slot-actions"><label class="file-button secondary" for="upload-back">Upload</label><label class="file-button camera-label" for="camera-back">Camera</label></div><button class="remove-button" type="button" data-remove="back">Remove image</button></article>
-      <article class="image-slot" data-label="side" id="slot-side"><div class="slot-heading"><span>SIDE</span><span class="slot-state" id="state-side">Optional</span></div><img class="preview" id="preview-side" alt="Side image preview"><div class="slot-empty" id="empty-side">Add side-panel information</div><input class="file-input" type="file" id="upload-side" accept="image/*" data-label="side"><input class="file-input" type="file" id="camera-side" accept="image/*" capture="environment" data-label="side"><div class="slot-actions"><label class="file-button secondary" for="upload-side">Upload</label><label class="file-button camera-label" for="camera-side">Camera</label></div><button class="remove-button" type="button" data-remove="side">Remove image</button></article>
+      <article class="image-slot" data-label="front" id="slot-front"><div class="slot-heading"><span>FRONT</span><span class="slot-state" id="state-front">No image</span></div><img class="preview" id="preview-front" alt="Front image preview"><div class="slot-empty" id="empty-front">Add the primary label image</div><input class="file-input" type="file" id="upload-front" accept="image/*" data-label="front"><input class="file-input" type="file" id="camera-front" accept="image/*" capture="environment" data-label="front"><div class="slot-actions"><label class="file-button secondary" for="upload-front">Upload</label><button class="file-button camera-label" type="button" data-camera-open="front">Camera</button><label class="file-button secondary" for="camera-front">Mobile capture</label></div><button class="remove-button" type="button" data-remove="front">Remove image</button></article>
+      <article class="image-slot" data-label="back" id="slot-back"><div class="slot-heading"><span>BACK</span><span class="slot-state" id="state-back">Optional</span></div><img class="preview" id="preview-back" alt="Back image preview"><div class="slot-empty" id="empty-back">Add supporting label details</div><input class="file-input" type="file" id="upload-back" accept="image/*" data-label="back"><input class="file-input" type="file" id="camera-back" accept="image/*" capture="environment" data-label="back"><div class="slot-actions"><label class="file-button secondary" for="upload-back">Upload</label><button class="file-button camera-label" type="button" data-camera-open="back">Camera</button><label class="file-button secondary" for="camera-back">Mobile capture</label></div><button class="remove-button" type="button" data-remove="back">Remove image</button></article>
+      <article class="image-slot" data-label="side" id="slot-side"><div class="slot-heading"><span>SIDE</span><span class="slot-state" id="state-side">Optional</span></div><img class="preview" id="preview-side" alt="Side image preview"><div class="slot-empty" id="empty-side">Add side-panel information</div><input class="file-input" type="file" id="upload-side" accept="image/*" data-label="side"><input class="file-input" type="file" id="camera-side" accept="image/*" capture="environment" data-label="side"><div class="slot-actions"><label class="file-button secondary" for="upload-side">Upload</label><button class="file-button camera-label" type="button" data-camera-open="side">Camera</button><label class="file-button secondary" for="camera-side">Mobile capture</label></div><button class="remove-button" type="button" data-remove="side">Remove image</button></article>
     </div>
+    <div class="inspector-fields"><label>Inspector ID (optional)<input type="text" id="inspectorId" autocomplete="off"></label><label>Reviewer name (optional)<input type="text" id="reviewerName" autocomplete="name"></label></div>
     <div class="submit-row"><label class="location-label"><input type="checkbox" id="geotag" checked> Attach my current location to this scan</label><button id="checkBtn" type="button">Check compliance</button></div>
   </section>
+  <dialog id="cameraDialog" aria-labelledby="cameraHeading"><h2 id="cameraHeading">Capture label image</h2><video id="cameraVideo" autoplay playsinline muted></video><p id="cameraMessage" aria-live="polite"></p><div class="camera-actions"><button type="button" class="secondary" id="cameraCancel">Cancel</button><button type="button" id="cameraCapture">Capture image</button></div></dialog>
   <div id="result" aria-live="polite"></div>
   <div id="history-table"><h2>Recent checks</h2><table id="historyTbl"><thead><tr><th>Product</th><th>Time</th><th>Status</th><th>Report</th></tr></thead><tbody></tbody></table></div>
 <script>
 const selectedImages = {};
 const slotLabels = ['front', 'back', 'side'];
 function getLocationIfRequested() { return new Promise((resolve) => { if (!document.getElementById('geotag').checked || !navigator.geolocation) { resolve(null); return; } navigator.geolocation.getCurrentPosition((pos) => resolve({ latitude: pos.coords.latitude, longitude: pos.coords.longitude }), () => resolve(null), { timeout: 5000 }); }); }
-function clearSlot(label) { const selected = selectedImages[label]; if (selected?.url) URL.revokeObjectURL(selected.url); delete selectedImages[label]; const slot = document.getElementById(`slot-${label}`); slot.classList.remove('is-selected'); document.getElementById(`preview-${label}`).removeAttribute('src'); document.getElementById(`preview-${label}`).style.display = 'none'; document.getElementById(`empty-${label}`).style.display = 'grid'; document.getElementById(`state-${label}`).textContent = label === 'front' ? 'No image' : 'Optional'; slot.querySelector('.remove-button').style.display = 'none'; slot.querySelector('.camera-label').textContent = 'Camera'; document.getElementById(`upload-${label}`).value = ''; document.getElementById(`camera-${label}`).value = ''; }
+function clearSlot(label) { window.sahiLabelCamera?.stop(); const selected = selectedImages[label]; if (selected?.url) URL.revokeObjectURL(selected.url); delete selectedImages[label]; const slot = document.getElementById(`slot-${label}`); slot.classList.remove('is-selected'); document.getElementById(`preview-${label}`).removeAttribute('src'); document.getElementById(`preview-${label}`).style.display = 'none'; document.getElementById(`empty-${label}`).style.display = 'grid'; document.getElementById(`state-${label}`).textContent = label === 'front' ? 'No image' : 'Optional'; slot.querySelector('.remove-button').style.display = 'none'; slot.querySelector('.camera-label').textContent = 'Camera'; document.getElementById(`upload-${label}`).value = ''; document.getElementById(`camera-${label}`).value = ''; }
 function selectImage(label, file) { if (!file || !file.type.startsWith('image/')) return; clearSlot(label); const url = URL.createObjectURL(file); selectedImages[label] = { file, url }; const slot = document.getElementById(`slot-${label}`); const preview = document.getElementById(`preview-${label}`); slot.classList.add('is-selected'); preview.src = url; preview.style.display = 'block'; document.getElementById(`empty-${label}`).style.display = 'none'; document.getElementById(`state-${label}`).textContent = 'Selected'; slot.querySelector('.camera-label').textContent = 'Retake'; const remove = slot.querySelector('.remove-button'); remove.style.display = 'block'; remove.textContent = 'Remove image'; }
 document.querySelectorAll('.file-input').forEach((input) => input.addEventListener('change', () => selectImage(input.dataset.label, input.files[0])));
 document.querySelectorAll('[data-remove]').forEach((button) => button.addEventListener('click', () => clearSlot(button.dataset.remove)));
-async function checkLabel() { const images = slotLabels.filter((label) => selectedImages[label]).map((label) => ({ label, file: selectedImages[label].file })); if (!images.length) { alert('Choose or capture at least one product image first.'); return; } const button = document.getElementById('checkBtn'); const resultDiv = document.getElementById('result'); button.disabled = true; button.textContent = 'Checking…'; resultDiv.innerHTML = ''; const formData = new FormData(); if (images.length === 1) { formData.append('file', images[0].file, images[0].file.name); } else { images.forEach(({ label, file }) => { formData.append('files', file, file.name); formData.append('image_labels', label); }); } const location = await getLocationIfRequested(); if (location) { formData.append('latitude', location.latitude); formData.append('longitude', location.longitude); } try { const response = await fetch('/check', { method: 'POST', body: formData }); if (!response.ok) throw new Error(`Request failed (${response.status})`); renderResult(await response.json()); loadHistory(); } catch (error) { resultDiv.innerHTML = '<p class="status-violation">Unable to check this image. Confirm the server is running, then try again.</p>'; } finally { button.disabled = false; button.textContent = 'Check compliance'; } }
+async function checkLabel() { const images = slotLabels.filter((label) => selectedImages[label]).map((label) => ({ label, file: selectedImages[label].file })); if (!images.length) { alert('Choose or capture at least one product image first.'); return; } const button = document.getElementById('checkBtn'); const resultDiv = document.getElementById('result'); button.disabled = true; button.textContent = 'Checking…'; resultDiv.innerHTML = ''; const formData = new FormData(); if (images.length === 1) { formData.append('file', images[0].file, images[0].file.name); } else { images.forEach(({ label, file }) => { formData.append('files', file, file.name); formData.append('image_labels', label); }); } const inspectorId = document.getElementById('inspectorId').value.trim(); const reviewerName = document.getElementById('reviewerName').value.trim(); if (inspectorId) formData.append('inspector_id', inspectorId); if (reviewerName) formData.append('reviewer_name', reviewerName); const location = await getLocationIfRequested(); if (location) { formData.append('latitude', location.latitude); formData.append('longitude', location.longitude); } try { const response = await fetch('/check', { method: 'POST', body: formData }); if (!response.ok) throw new Error(`Request failed (${response.status})`); renderResult(await response.json()); loadHistory(); } catch (error) { resultDiv.innerHTML = '<p class="status-violation">Unable to check this image. Confirm the server is running, then try again.</p>'; } finally { button.disabled = false; button.textContent = 'Check compliance'; } }
 document.getElementById('checkBtn').addEventListener('click', checkLabel);
 function safeText(value, fallback = 'Not detected') { return value === null || value === undefined || value === '' ? fallback : String(value); }
 function escapeHtml(value, fallback) { return safeText(value, fallback).replace(/[&<>'"]/g, (character) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;' })[character]); }
@@ -81,6 +95,76 @@ renderResult = function(data) {
 };
 async function loadHistory() { try { const response = await fetch('/history'); const items = await response.json(); document.querySelector('#historyTbl tbody').innerHTML = items.map((item) => `<tr><td>${escapeHtml(item.filename)}</td><td>${escapeHtml(item.timestamp)}</td><td class="status-${(item.overall_result || (item.overall_compliant ? 'PASS' : 'VIOLATION')).toLowerCase()}">${escapeHtml(item.overall_result || (item.overall_compliant ? 'PASS' : 'VIOLATION'))}</td><td><a href="/report/${encodeURIComponent(item.id)}/pdf" target="_blank">PDF</a></td></tr>`).join(''); } catch (_) { /* History is optional for a new scan. */ } }
 loadHistory();
+</script>
+<script src="/static/camera.js"></script>
+<script>
+window.sahiLabelSelectImage = selectImage;
+
+function scoreSummary(itemId, overallResult) {
+  const target = document.getElementById('scoreSummary');
+  if (!target) return;
+  if (overallResult === 'REVIEW') {
+    target.innerHTML = '<p><strong>Compliance score:</strong> Pending review</p><p><strong>Grade:</strong> Not assigned</p>';
+    return;
+  }
+  fetch(`/score/${encodeURIComponent(itemId)}`).then((response) => response.json()).then((scoreData) => {
+    if (!document.getElementById('scoreSummary')) return;
+    target.innerHTML = `<p><strong>Compliance score:</strong> ${escapeHtml(scoreData.score, 'unavailable')}/100</p><p><strong>Grade:</strong> ${escapeHtml(scoreData.grade, 'Not assigned')}</p>`;
+  }).catch(() => { target.textContent = 'Compliance score unavailable.'; });
+}
+
+function reviewPanel(itemId, review) {
+  if (!review?.found && !review?.created && !review?.review_id) {
+    return '<section class="inspector-panel"><h3>Inspector review</h3><p>This result needs review. Enter an inspector ID and reviewer name before checking an image to create an auditable pending review.</p></section>';
+  }
+  const status = review.inspector_decision || 'PENDING';
+  const completed = status !== 'PENDING';
+  return `<section class="inspector-panel" id="inspectorReview"><h3>Inspector review</h3><p><strong>Review ID:</strong> ${escapeHtml(review.review_id || itemId)} · <strong>Status:</strong> <span id="reviewStatus">${escapeHtml(status)}</span></p><p>${completed ? 'The original automated decision is preserved in the review audit trail.' : 'Confirm after checking the physical package, or override with a reason.'}</p>${completed ? '' : '<label>Review reason (required to override)<textarea id="reviewReason" rows="2" placeholder="State why an override is needed"></textarea></label><div class="review-actions"><button type="button" id="confirmReview">Confirm review</button><button type="button" class="secondary" id="overrideReview">Override with reason</button></div><p id="reviewMessage" aria-live="polite"></p>'}</section>`;
+}
+
+async function fetchReview(itemId, suppliedReview) {
+  if (suppliedReview) return suppliedReview;
+  try {
+    const response = await fetch(`/inspector-reviews/${encodeURIComponent(itemId)}`);
+    return response.ok ? await response.json() : null;
+  } catch (_) { return null; }
+}
+
+async function renderReviewPanel(itemId, suppliedReview) {
+  const review = await fetchReview(itemId, suppliedReview);
+  const result = document.getElementById('result');
+  if (!result || result.dataset.itemId !== itemId) return;
+  result.insertAdjacentHTML('beforeend', reviewPanel(itemId, review));
+  document.getElementById('confirmReview')?.addEventListener('click', () => submitReview(itemId, 'confirm'));
+  document.getElementById('overrideReview')?.addEventListener('click', () => submitReview(itemId, 'override'));
+}
+
+async function submitReview(itemId, action) {
+  const inspectorId = document.getElementById('inspectorId').value.trim();
+  const reviewerName = document.getElementById('reviewerName').value.trim();
+  const reason = document.getElementById('reviewReason')?.value.trim() || '';
+  const message = document.getElementById('reviewMessage');
+  if (!inspectorId || !reviewerName) { message.textContent = 'Inspector ID and reviewer name are required.'; return; }
+  if (action === 'override' && !reason) { message.textContent = 'An override reason is required.'; return; }
+  const response = await fetch(`/inspector-reviews/${encodeURIComponent(itemId)}/${action}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ inspector_id: inspectorId, reviewer_name: reviewerName, reason }) });
+  const payload = await response.json();
+  if (!response.ok) { message.textContent = payload.detail || payload.error || 'Review update failed.'; return; }
+  document.getElementById('inspectorReview').outerHTML = reviewPanel(itemId, payload);
+}
+
+const renderResultWithEvidence = renderResult;
+renderResult = function(data) {
+  renderResultWithEvidence(data);
+  const report = data.report || {};
+  const overallResult = report.overall_result || (report.overall_compliant ? 'PASS' : 'VIOLATION');
+  const result = document.getElementById('result');
+  result.dataset.itemId = data.id;
+  const legacyScore = document.getElementById('scoreDisplay');
+  if (legacyScore) legacyScore.id = 'legacyScoreDisplay';
+  document.getElementById('legacyScoreDisplay')?.parentElement.replaceWith(Object.assign(document.createElement('div'), { id: 'scoreSummary' }));
+  scoreSummary(data.id, overallResult);
+  if (overallResult === 'REVIEW') renderReviewPanel(data.id, data.inspector_review);
+};
 </script>
 </body>
 </html>

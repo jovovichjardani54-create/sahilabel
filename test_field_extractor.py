@@ -165,6 +165,15 @@ class FieldExtractorTests(unittest.TestCase):
         self.assertEqual(mrp["value"], "₹300.00")
         self.assertNotIn("₹0.40", mrp["evidence_text"])
 
+    def test_marker_backed_mrp_prefers_package_price_over_nearby_unit_price(self):
+        fields = extract_fields(words_from_lines(
+            [("MRP", 94), ("₹300.00", 95), ("₹0.40", 96), ("/", 96), ("ml", 96)],
+        ))
+
+        self.assertEqual(fields["mrp"]["status"], FOUND)
+        self.assertEqual(fields["mrp"]["value"], "₹300.00")
+        self.assertNotIn("₹0.40", fields["mrp"]["evidence_text"])
+
     def test_consumer_care_can_use_contiguous_digit_fragments(self):
         fields = extract_fields(words_from_lines(
             [("Customer", 94), ("Care", 94), ("1800", 94), ("123", 94), ("456", 94)],

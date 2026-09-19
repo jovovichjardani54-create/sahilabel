@@ -43,6 +43,19 @@ def compute_score(report: dict) -> dict:
             "deductions": {"readability": int, "notes": int}
         }
     """
+    # REVIEW means the evidence or image quality needs a human decision.  A
+    # numeric zero and grade F imply a failed legal check, so neither is a
+    # meaningful score until that review is complete.
+    if report.get("overall_result") == "REVIEW":
+        return {
+            "score": None,
+            "grade": None,
+            "pending_review": True,
+            "message": "Pending review",
+            "category_breakdown": {},
+            "deductions": {"readability": 0, "notes": 0},
+        }
+
     fields = report["fields"]
 
     critical_keys = [k for k, v in fields.items() if v["severity"] == "critical"]
@@ -94,6 +107,7 @@ def compute_score(report: dict) -> dict:
     return {
         "score": final_score,
         "grade": grade,
+        "pending_review": False,
         "category_breakdown": category_breakdown,
         "deductions": {
             "readability": readability_deduction,
