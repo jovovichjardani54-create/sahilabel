@@ -1,6 +1,7 @@
 """Structured, position-aware extraction of package declarations from OCR output."""
 
 import re
+from difflib import SequenceMatcher
 
 from field_vocab import GENERIC_PRODUCT_TERMS
 
@@ -22,7 +23,12 @@ PHONE_RE = re.compile(r"\b\d{10}\b")
 EMAIL_RE = re.compile(r"[\w.+-]+@[\w.-]+\.[a-z]{2,}\b", re.I)
 CARE_RE = re.compile(r"\b(customer|consumer)\s*care\b|\bhelpline\b|\btoll\s*-?\s*free\b", re.I)
 NET_MARKER_RE = re.compile(r"\bnet\s*(?:weight|wt|quantity)\b|\bcontents?\b", re.I)
-SERVING_RE = re.compile(r"\bserving\s*size\b|\bper\s*serving\b|\bnutrition\b|\benergy\b|\bunit\s*price\b", re.I)
+SERVING_RE = re.compile(
+    r"\bserving\s*size\b|\bper\s*serving\b|"
+    r"\bper\s*\d+(?:\.\d+)?\s*(?:g|kg|ml|l)\b|"
+    r"\bnutrition\b|\benergy\b|\bunit\s*price\b",
+    re.I,
+)
 DATE_MARKER_RE = re.compile(r"\b(?:date\w*\s*(?:of\s*)?(?:packing|packaging)|packed\s*on|pkd)\b", re.I)
 ENTITY_TERMS = {"industries", "foods", "private", "pvt", "limited", "ltd", "llp", "lt"}
 NUTRITION_TERMS = {"sugar", "protein", "carbohydrate", "carbohydrates"}
@@ -132,6 +138,13 @@ def _net_markers(words: list[dict], lines: list[list[dict]]) -> list[list[dict]]
         for weight_word in weight_words:
             if abs(_center(net_word)[1] - _center(weight_word)[1]) <= 35 and _distance(net_word, weight_word) <= 180:
                 markers.append([net_word, weight_word])
+    # Real-label OCR may merge the commodity name and net declaration into one
+    # token (for example, "BISCUMTSNETWEIGHT"). The original word remains the
+    # evidence source; this only recognizes its embedded declaration context.
+    for word in words:
+        cleaned = _clean(word["text"])
+        if any(marker in cleaned for marker in ("netweight", "netwt", "netquantity")):
+            markers.append([word])
     return markers
 
 
@@ -173,6 +186,15 @@ def _extract_manufacturer(words: list[dict], lines: list[list[dict]]) -> dict:
                 phrase = [word for word in phrase if _clean(word["text"]) not in
                           {"of", "the", "lot", "plot", "no", "number"}
                           and not _clean(word["text"]).isdigit()]
+                # OCR line grouping can join two printed columns. A colon is a
+                # reliable boundary between a nutrition/table label and the
+                # company phrase that follows it.
+                colon_positions = [position for position, word in enumerate(phrase[:-1])
+                                   if ":" in word["text"]]
+                if colon_positions:
+                    phrase = phrase[colon_positions[-1] + 1:]
+                while phrase and not re.search(r"[a-z0-9]", phrase[0]["text"], re.I):
+                    phrase.pop(0)
                 while phrase and _clean(phrase[0]["text"]) in {"unit", "unit2", "plot", "no", "number"}:
                     phrase.pop(0)
                 if not phrase:
@@ -204,8 +226,19 @@ def _extract_product(words: list[dict], lines: list[list[dict]]) -> dict:
     occurrences = {}
     for word in words:
         cleaned = re.sub(r"[^a-z]", "", word["text"].casefold())
-        if cleaned in terms:
-            occurrences.setdefault(cleaned, []).append(word)
+        candidate = cleaned if cleaned in terms else None
+        if candidate is None:
+            # Match only an OCR-like spelling of a configured commodity term.
+            # Split an embedded declaration suffix first; this avoids treating
+            # arbitrary long OCR noise as a product name.
+            segment = re.split(r"net(?:weight|wt|quantity)|contents?", cleaned)[0]
+            close_terms = [term for term in terms
+                           if len(segment) >= 4 and abs(len(segment) - len(term)) <= 2
+                           and SequenceMatcher(None, segment, term).ratio() >= 0.78]
+            if close_terms:
+                candidate = max(close_terms, key=lambda term: SequenceMatcher(None, segment, term).ratio())
+        if candidate:
+            occurrences.setdefault(candidate, []).append(word)
     if occurrences:
         heights = sorted(word["height"] for word in words) or [1]
         median_height = heights[len(heights) // 2] or 1
@@ -216,6 +249,7 @@ def _extract_product(words: list[dict], lines: list[list[dict]]) -> dict:
             index, line = _line_for_word(lines, best_word)
             context_lines = lines[max(0, index - 1):index + 2] if index >= 0 else [[best_word]]
             context = " ".join(_line_text(item) for item in context_lines).casefold()
+            candidate_line = _line_text(line).casefold() if line else best_word["text"].casefold()
             score = float(best_word["conf"]) + min(25, best_word["height"] / median_height * 10)
             score += min(24, (len(matches) - 1) * 12)
             if "ingredient" in context:
@@ -223,11 +257,18 @@ def _extract_product(words: list[dict], lines: list[list[dict]]) -> dict:
             distance = _marker_distance(matches, net_markers)
             if distance < 250:
                 score += max(0, 20 - distance / 15)
-            if term in NUTRITION_TERMS and re.search(
-                r"nutrition|total\s+sugar|added\s+sugar|protein|carbohydrates?|blood\s+sugar", context
-            ):
+            nutrition_context = bool(re.search(
+                r"nutrition|total\s+sugar|added\s+sugar|protein|carbohydrates?|blood\s+sugar", candidate_line
+            ))
+            if nutrition_context:
+                # A commodity word in a nutrition panel describes a nutrient,
+                # not the package's generic product name. Do not substitute a
+                # weaker nutrition candidate when no title is visible.
                 score -= 120
-            ranked.append((score, term, best_word, len(matches)))
+            else:
+                ranked.append((score, term, best_word, len(matches)))
+        if not ranked:
+            return _empty("Configured commodity words were found only in nutrition context, not as a product declaration.")
         _, term, best_word, repetitions = max(ranked, key=lambda item: item[0])
         return _result(
             term.upper(), FOUND, [best_word],
@@ -245,8 +286,15 @@ def _extract_quantity(words: list[dict], lines: list[list[dict]]) -> dict:
         for match in QUANTITY_RE.finditer(text):
             evidence = _matching_words(line, match)
             value = f"{match.group(1)}{match.group(2).lower()}"
-            context = text.casefold()
+            line_index = next((index for index, candidate_line in enumerate(lines) if candidate_line is line), -1)
+            nearby_lines = lines[max(0, line_index - 1):line_index + 2] if line_index >= 0 else [line]
+            context = " ".join(_line_text(candidate_line) for candidate_line in nearby_lines).casefold()
             distance = _marker_distance(evidence, markers)
+            # Per-serving and nutrition-table quantities are measurements, not
+            # package net quantity, unless a separate net declaration anchors
+            # the value spatially.
+            if SERVING_RE.search(context) and distance > 180:
+                continue
             score = _confidence(evidence) + (130 if distance <= 180 else 0)
             if SERVING_RE.search(context):
                 score -= 160
@@ -285,14 +333,22 @@ def _extract_mrp(words: list[dict], lines: list[list[dict]]) -> dict:
     marker_words = [w for w in words if "mrp" in re.sub(r"[^a-z]", "", w["text"].casefold())]
     if not marker_words:
         return _empty("No MRP marker or OCR variant was detected.")
-    marker = marker_words[0]
-    candidates = [w for w in words if _is_price(w) and w["top"] >= marker["top"] - 20]
-    candidates = [w for w in candidates if w["top"] - marker["top"] <= 150]
+    candidates = [w for w in words if _is_price(w)]
+    candidates = [w for w in candidates if any(
+        w["top"] >= marker["top"] - 20 and w["top"] - marker["top"] <= 150
+        for marker in marker_words
+    )]
     if not candidates:
-        return _result(None, UNCERTAIN, [marker], "MRP marker found, but no nearby reliable price was detected; no price was invented.")
-    price = min(candidates, key=lambda w: (abs(w["top"] - marker["top"]), abs(w["left"] - marker["left"])))
+        return _result(None, UNCERTAIN, marker_words, "MRP marker found, but no nearby reliable price was detected; no price was invented.")
+    def price_rank(price: dict) -> tuple[float, float]:
+        _, line = _line_for_word(lines, price)
+        unit_price = bool(re.search(r"\bper\s*(?:g|kg|ml|l)\b|/\s*(?:g|kg|ml|l)\b", _line_text(line), re.I))
+        distance = min(_distance(price, marker) for marker in marker_words)
+        return (500.0 if unit_price else 0.0, distance)
+    price = min(candidates, key=price_rank)
+    marker = min(marker_words, key=lambda word: _distance(word, price))
     return _result(price["text"].strip(), FOUND, [marker, price],
-                   "Associated an MRP marker variant with the nearest nearby decimal price, excluding unit prices.")
+                   "Associated an MRP marker variant with the nearest nearby decimal price after excluding unit-price context.")
 
 
 def _extract_date(words: list[dict], lines: list[list[dict]]) -> dict:
@@ -300,7 +356,11 @@ def _extract_date(words: list[dict], lines: list[list[dict]]) -> dict:
     for line in lines:
         text = _line_text(line)
         for match in DATE_RE.finditer(text):
-            matches.append((match.group(0), _matching_words(line, match)))
+            value = match.group(0)
+            numeric = re.fullmatch(r"(\d{1,2})[/-](\d{1,2})[/-](\d{2,4})", value)
+            if numeric and not (1 <= int(numeric.group(2)) <= 12):
+                continue
+            matches.append((value, _matching_words(line, match)))
     if not matches:
         marker_evidence = []
         for line in lines:
@@ -348,6 +408,23 @@ def _extract_consumer_care(words: list[dict], lines: list[list[dict]]) -> dict:
             if match:
                 evidence = care_anchors + _matching_words(line, match)
                 return _result(match.group(0), FOUND, evidence, f"Matched a valid consumer-care {label} near care/helpline evidence.")
+        ordered = sorted(line, key=lambda word: word["left"])
+        for start, word in enumerate(ordered):
+            if not re.fullmatch(r"\d{1,4}", word["text"].strip()):
+                continue
+            fragments, digits = [], ""
+            for candidate in ordered[start:]:
+                token = candidate["text"].strip()
+                if not re.fullmatch(r"\d{1,4}", token):
+                    break
+                fragments.append(candidate)
+                digits += token
+                if len(digits) >= 10:
+                    break
+            if len(digits) == 10:
+                evidence = care_anchors + fragments
+                return _result(digits, FOUND, evidence,
+                               "Matched a ten-digit consumer-care phone number from contiguous OCR digit fragments near care/helpline evidence.")
     if care_anchors:
         fragments = [word for word in search_words if
                      min(abs(_center(word)[1] - _center(anchor)[1]) for anchor in care_anchors) <= 35
