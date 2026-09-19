@@ -8,6 +8,7 @@ __pycache__/
 reports/
 annotated/
 uploads/
+db/*.sqlite3
 .env
 *.log
 test_label.jpg.jpeg

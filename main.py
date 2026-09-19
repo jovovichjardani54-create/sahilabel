@@ -24,6 +24,10 @@ from fastapi.staticfiles import StaticFiles
 from ocr_pipeline import extract_text
 from compliance_checker import check_fields
 from report_pdf import generate_pdf_report
+from history_store import HistoryStore
+from inspector_review import create_inspector_review
+from product_record import OCRResult, ProductRecord
+from quality_gate import assess_image_quality
 
 # --- PLUGIN IMPORTS (new, additive only) ---
 from plugins.scoring import compute_score
@@ -37,10 +41,13 @@ UPLOAD_DIR = "uploads"
 REPORT_DIR = "reports"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(REPORT_DIR, exist_ok=True)
+os.makedirs("db", exist_ok=True)
 
 # Simple in-memory history (swap for SQLite before final submission -
 # this is fine for a hackathon demo, but resets on server restart)
 HISTORY = []
+HISTORY_STORE = HistoryStore(os.path.join("db", "history.sqlite3"))
+PRODUCT_RECORDS = {}
 
 # --- PLUGIN STORAGE (new, additive only) ---
 # Kept separate from HISTORY/record dicts on purpose, so the existing
@@ -51,25 +58,56 @@ _PLUGIN_STORE = {}  # item_id -> {"image_path": str, "ocr_words": list}
 
 @app.post("/check")
 async def check_label(
-    file: UploadFile = File(...),
+    file: UploadFile | None = File(None),
+    files: list[UploadFile] | None = File(None),
+    image_labels: list[str] | None = Form(None),
     latitude: float = Form(None),   # Feature: Geotagged Inspections
     longitude: float = Form(None),  # optional - None if not sent/denied
     inspector_id: str = Form(None), # optional - wire up once auth exists
 ):
-    content_type = file.content_type or ""
-    if not content_type.startswith("image/"):
-        raise HTTPException(400, "Please upload an image file")
+    uploads = files if files else ([file] if file is not None else [])
+    if not uploads:
+        raise HTTPException(400, "Please upload at least one image file")
+    if image_labels is not None and len(image_labels) != len(uploads):
+        raise HTTPException(400, "image_labels must have one label for each uploaded file")
+    for upload in uploads:
+        if not (upload.content_type or "").startswith("image/"):
+            raise HTTPException(400, "Please upload image files only")
 
-    filename = file.filename or "uploaded_image.jpg"
+    filename = uploads[0].filename or "uploaded_image.jpg"
     item_id = str(uuid.uuid4())[:8]
-    ext = os.path.splitext(filename)[1] or ".jpg"
-    image_path = os.path.join(UPLOAD_DIR, f"{item_id}{ext}")
+    default_labels = ("front", "back", "side")
+    labels = image_labels or [
+        default_labels[index] if index < len(default_labels) else f"image-{index + 1}"
+        for index in range(len(uploads))
+    ]
+    product_record = ProductRecord(product_id=item_id, session_id=item_id)
+    image_paths, quality_assessments, ocr_results = [], [], []
+    for index, (upload, label) in enumerate(zip(uploads, labels)):
+        uploaded_name = upload.filename or f"uploaded_image_{index + 1}.jpg"
+        ext = os.path.splitext(uploaded_name)[1] or ".jpg"
+        path = os.path.join(UPLOAD_DIR, f"{item_id}_{index + 1}{ext}")
+        with open(path, "wb") as destination:
+            destination.write(await upload.read())
+        quality = assess_image_quality(path)
+        ocr_result = extract_text(path)
+        product_record.add_image(
+            label, path, [OCRResult(ocr_result.get("full_text", ""), ocr_result.get("words", []))]
+        )
+        image_paths.append(path)
+        quality_assessments.append({"label": label.strip().lower(), **quality})
+        ocr_results.append(ocr_result)
 
-    with open(image_path, "wb") as f:
-        f.write(await file.read())
-
-    ocr_result = extract_text(image_path)
-    report = check_fields(ocr_result)
+    # The established OCR and annotation pipeline has one coordinate space.
+    # Keep its single-image evidence behavior intact while retaining additional
+    # source views in ProductRecord for follow-up inspection.
+    image_path = image_paths[0]
+    ocr_result = ocr_results[0]
+    ocr_quality_sufficient = quality_assessments[0]["recommendation"] == "PROCEED"
+    report = check_fields(ocr_result, False, ocr_quality_sufficient)
+    report["quality_assessment"] = quality_assessments[0]
+    if len(quality_assessments) > 1:
+        report["additional_quality_assessments"] = quality_assessments[1:]
 
     # Generate evidence once from the already-computed OCR/report data so the
     # PDF and /annotated endpoint reuse the same decision-specific image.
@@ -94,9 +132,25 @@ async def check_label(
             if latitude is not None and longitude is not None else None
         ),
         "inspector_id": inspector_id,
+        "product_record": {
+            "image_labels": [image.label for image in product_record.image_list],
+            "coverage_status": product_record.coverage_status.value,
+        },
         "report": report,
     }
+    if report["overall_result"] == "REVIEW" and inspector_id:
+        record["inspector_review"] = create_inspector_review(
+            reviewer=inspector_id,
+            automated_decision=report["overall_result"],
+            inspector_decision="PENDING",
+        ).to_dict()
     HISTORY.append(record)
+    HISTORY_STORE.save_report(
+        item_id, filename, report,
+        reviewer_status=(record.get("inspector_review") or {}).get("inspector_decision"),
+        created_at=record["timestamp"],
+    )
+    PRODUCT_RECORDS[item_id] = product_record
 
     # PLUGIN: stash what scoring/highlighting/explanations will need,
     # without touching `record` or HISTORY's shape at all
@@ -119,10 +173,60 @@ async def download_pdf(item_id: str):
 
 @app.get("/history")
 async def get_history():
-    # Return newest first, without the full report body (keep it light)
-    return [
-        {k: v for k, v in r.items() if k != "report"} for r in reversed(HISTORY)
-    ]
+    # Return persisted, compact metadata only; uploaded images and PDFs remain
+    # filesystem artifacts and are intentionally not copied into SQLite.
+    active_records = {record["id"]: record for record in HISTORY}
+    history = []
+    for item in HISTORY_STORE.list_recent_reports():
+        active_record = active_records.get(item["product_session_id"])
+        if active_record is not None:
+            history.append({key: value for key, value in active_record.items() if key != "report"})
+            continue
+        history.append({
+            "id": item["product_session_id"],
+            "filename": item["filename"],
+            "timestamp": item["created_at"],
+            "overall_compliant": item["overall_result"] == "PASS",
+            "overall_result": item["overall_result"],
+            "location": None,
+            "inspector_id": None,
+            "reviewer_status": item["reviewer_status"],
+        })
+    return history
+
+
+@app.get("/history/search")
+async def search_history(
+    query: str | None = None,
+    status: str | None = None,
+    start_date: str | None = None,
+    end_date: str | None = None,
+):
+    """Search compact persisted summaries without changing /history."""
+    try:
+        return HISTORY_STORE.search_reports(
+            query, overall_result=status, start_date=start_date, end_date=end_date
+        )
+    except (TypeError, ValueError) as error:
+        raise HTTPException(400, str(error)) from error
+
+
+@app.get("/history/analytics")
+async def history_analytics(start_date: str | None = None, end_date: str | None = None):
+    """Return lightweight result totals for the requested date range."""
+    try:
+        return HISTORY_STORE.analytics_counts(start_date=start_date, end_date=end_date)
+    except (TypeError, ValueError) as error:
+        raise HTTPException(400, str(error)) from error
+
+
+@app.get("/history/{item_id}")
+async def get_history_summary(item_id: str):
+    """Retrieve one compact persisted report summary."""
+    summary = HISTORY_STORE.get_report_summary(item_id)
+    if summary is None:
+        raise HTTPException(404, "History record not found")
+    return summary
 
 
 # ============================================================
