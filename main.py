@@ -26,6 +26,7 @@ from compliance_checker import check_fields
 from report_pdf import generate_pdf_report
 from history_store import HistoryStore
 from inspector_review import create_inspector_review
+from inspector_review_router import router as inspector_review_router
 from product_record import OCRResult, ProductRecord
 from quality_gate import assess_image_quality
 
@@ -36,6 +37,7 @@ from plugins.explanations import build_full_explanation_set
 from plugins.dashboard_stats import compute_dashboard_stats
 
 app = FastAPI(title="Legal Metrology Compliance Checker")
+app.include_router(inspector_review_router)
 
 UPLOAD_DIR = "uploads"
 REPORT_DIR = "reports"

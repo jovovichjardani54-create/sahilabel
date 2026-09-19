@@ -13,12 +13,24 @@ from typing import Any
 
 
 VALID_INSPECTOR_DECISIONS = frozenset({"CONFIRMED", "OVERRIDDEN", "PENDING"})
+COMPLETED_INSPECTOR_DECISIONS = frozenset({"CONFIRMED", "OVERRIDDEN"})
 REVIEW_REQUIRED_STATUSES = frozenset({"REVIEW"})
 PASS_STATUSES = frozenset({"PASS"})
 VIOLATION_STATUSES = frozenset({"VIOLATION", "FAIL"})
 MISSING_REVIEW_MESSAGE = "No inspector review exists for this item"
 REVIEW_NOT_REQUIRED_MESSAGE = (
     "PASS and VIOLATION results do not require inspector review"
+)
+REVIEW_ALREADY_EXISTS_MESSAGE = "a review already exists for this item"
+REVIEW_ALREADY_COMPLETED_MESSAGE = "review is already completed"
+INVALID_CONFIRM_AFTER_OVERRIDE_MESSAGE = (
+    "cannot confirm a review that was already overridden"
+)
+INVALID_OVERRIDE_AFTER_CONFIRM_MESSAGE = (
+    "cannot override a review that was already confirmed"
+)
+AI_NOT_FINAL_LEGAL_DECISION_MESSAGE = (
+    "AI output is not a final legal decision until inspector verification"
 )
 
 
@@ -138,6 +150,19 @@ class InspectorReview:
     def automated_decision(self) -> Any:
         return deepcopy(self._automated_decision)
 
+    @property
+    def is_completed(self) -> bool:
+        return self.inspector_decision in COMPLETED_INSPECTOR_DECISIONS
+
+    def _normalize_field_confirmations(
+        self, field_confirmations: dict[str, Any] | None
+    ) -> dict[str, Any] | None:
+        if field_confirmations is None:
+            return None
+        if not isinstance(field_confirmations, dict):
+            raise InspectorReviewError("field_confirmations must be a dictionary")
+        return deepcopy(field_confirmations)
+
     def _event(self, action: str, at: datetime, reason: str | None = None) -> dict[str, Any]:
         return {
             "action": action,
@@ -147,6 +172,7 @@ class InspectorReview:
             "reason": reason,
             "at": _iso(at),
             "automated_decision": self.automated_decision,
+            "field_confirmations": deepcopy(self.field_confirmations),
         }
 
     def confirm(
@@ -155,14 +181,22 @@ class InspectorReview:
         inspector_id: str,
         reviewer_name: str,
         reason: str | None = None,
+        field_confirmations: dict[str, Any] | None = None,
         confirmed_at: datetime | None = None,
     ) -> InspectorReview:
-        self.inspector_id, self.reviewer_name = _require_inspector_identity(
-            inspector_id, reviewer_name
-        )
+        inspector, name = _require_inspector_identity(inspector_id, reviewer_name)
+        if self.inspector_decision == "CONFIRMED":
+            return self
+        if self.inspector_decision == "OVERRIDDEN":
+            raise InspectorReviewError(INVALID_CONFIRM_AFTER_OVERRIDE_MESSAGE)
+        confirmations = self._normalize_field_confirmations(field_confirmations)
+        self.inspector_id = inspector
+        self.reviewer_name = name
         self.reviewer = self.reviewer_name
         self.inspector_decision = "CONFIRMED"
         self.reason = _clean_text(reason)
+        if confirmations is not None:
+            self.field_confirmations = confirmations
         self.reviewed_at = confirmed_at or _now()
         self.audit_trail.append(self._event("confirmed", self.reviewed_at, self.reason))
         return self
@@ -173,17 +207,25 @@ class InspectorReview:
         inspector_id: str,
         reviewer_name: str,
         reason: str,
+        field_confirmations: dict[str, Any] | None = None,
         overridden_at: datetime | None = None,
     ) -> InspectorReview:
         reason_text = _clean_text(reason)
         if not reason_text:
             raise InspectorReviewError("override reason is required")
-        self.inspector_id, self.reviewer_name = _require_inspector_identity(
-            inspector_id, reviewer_name
-        )
+        inspector, name = _require_inspector_identity(inspector_id, reviewer_name)
+        if self.inspector_decision == "OVERRIDDEN":
+            raise InspectorReviewError(REVIEW_ALREADY_COMPLETED_MESSAGE)
+        if self.inspector_decision == "CONFIRMED":
+            raise InspectorReviewError(INVALID_OVERRIDE_AFTER_CONFIRM_MESSAGE)
+        confirmations = self._normalize_field_confirmations(field_confirmations)
+        self.inspector_id = inspector
+        self.reviewer_name = name
         self.reviewer = self.reviewer_name
         self.inspector_decision = "OVERRIDDEN"
         self.reason = reason_text
+        if confirmations is not None:
+            self.field_confirmations = confirmations
         self.reviewed_at = overridden_at or _now()
         self.audit_trail.append(self._event("overridden", self.reviewed_at, reason_text))
         return self
@@ -205,6 +247,13 @@ class InspectorReview:
             "audit_trail": deepcopy(self.audit_trail),
             "review_required": True,
             "found": True,
+            "is_final_legal_decision": self.is_completed,
+            "decision_support_only": not self.is_completed,
+            "legal_notice": (
+                AI_NOT_FINAL_LEGAL_DECISION_MESSAGE
+                if not self.is_completed
+                else "Inspector verification recorded; original automated decision is preserved"
+            ),
         }
 
 
@@ -243,6 +292,9 @@ def missing_review_response(review_id: str | None = None) -> dict[str, Any]:
         "automated_decision": None,
         "reason": None,
         "audit_trail": [],
+        "is_final_legal_decision": False,
+        "decision_support_only": True,
+        "legal_notice": AI_NOT_FINAL_LEGAL_DECISION_MESSAGE,
         "message": MISSING_REVIEW_MESSAGE,
     }
 
@@ -275,8 +327,13 @@ class InspectorReviewRegistry:
                 "review_required": False,
                 "inspector_decision": None,
                 "automated_decision": deepcopy(automated_decision),
+                "is_final_legal_decision": False,
+                "decision_support_only": True,
+                "legal_notice": AI_NOT_FINAL_LEGAL_DECISION_MESSAGE,
                 "message": REVIEW_NOT_REQUIRED_MESSAGE,
             }
+        if item_id in self._reviews:
+            raise InspectorReviewError(REVIEW_ALREADY_EXISTS_MESSAGE)
         review = InspectorReview(
             review_id=item_id,
             automated_decision=automated_decision,
@@ -300,6 +357,13 @@ class InspectorReviewRegistry:
         payload["message"] = None
         return payload
 
+    def list_pending(self) -> list[dict[str, Any]]:
+        return [
+            review.to_dict()
+            for review in self._reviews.values()
+            if review.inspector_decision == "PENDING"
+        ]
+
     def _require(self, review_id: str) -> InspectorReview:
         item_id = _clean_text(review_id)
         if not item_id or item_id not in self._reviews:
@@ -313,10 +377,23 @@ class InspectorReviewRegistry:
         inspector_id: str,
         reviewer_name: str,
         reason: str | None = None,
+        field_confirmations: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         review = self._require(review_id)
-        review.confirm(inspector_id=inspector_id, reviewer_name=reviewer_name, reason=reason)
-        return review.to_dict()
+        before = review.to_dict()
+        review.confirm(
+            inspector_id=inspector_id,
+            reviewer_name=reviewer_name,
+            reason=reason,
+            field_confirmations=field_confirmations,
+        )
+        payload = review.to_dict()
+        payload["idempotent"] = (
+            before["inspector_decision"] == "CONFIRMED"
+            and payload["inspector_decision"] == "CONFIRMED"
+            and len(before["audit_trail"]) == len(payload["audit_trail"])
+        )
+        return payload
 
     def override(
         self,
@@ -325,9 +402,15 @@ class InspectorReviewRegistry:
         inspector_id: str,
         reviewer_name: str,
         reason: str,
+        field_confirmations: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         review = self._require(review_id)
-        review.override(inspector_id=inspector_id, reviewer_name=reviewer_name, reason=reason)
+        review.override(
+            inspector_id=inspector_id,
+            reviewer_name=reviewer_name,
+            reason=reason,
+            field_confirmations=field_confirmations,
+        )
         return review.to_dict()
 
 
@@ -353,18 +436,24 @@ def get_review_status(review_id: str) -> dict[str, Any]:
     return REGISTRY.get(review_id)
 
 
+def list_pending_reviews() -> list[dict[str, Any]]:
+    return REGISTRY.list_pending()
+
+
 def confirm_review(
     review_id: str,
     *,
     inspector_id: str,
     reviewer_name: str,
     reason: str | None = None,
+    field_confirmations: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     return REGISTRY.confirm(
         review_id,
         inspector_id=inspector_id,
         reviewer_name=reviewer_name,
         reason=reason,
+        field_confirmations=field_confirmations,
     )
 
 
@@ -374,10 +463,12 @@ def override_review(
     inspector_id: str,
     reviewer_name: str,
     reason: str,
+    field_confirmations: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     return REGISTRY.override(
         review_id,
         inspector_id=inspector_id,
         reviewer_name=reviewer_name,
         reason=reason,
+        field_confirmations=field_confirmations,
     )
