@@ -195,6 +195,40 @@ async def get_history():
     return history
 
 
+@app.get("/history/search")
+async def search_history(
+    query: str | None = None,
+    status: str | None = None,
+    start_date: str | None = None,
+    end_date: str | None = None,
+):
+    """Search compact persisted summaries without changing /history."""
+    try:
+        return HISTORY_STORE.search_reports(
+            query, overall_result=status, start_date=start_date, end_date=end_date
+        )
+    except (TypeError, ValueError) as error:
+        raise HTTPException(400, str(error)) from error
+
+
+@app.get("/history/analytics")
+async def history_analytics(start_date: str | None = None, end_date: str | None = None):
+    """Return lightweight result totals for the requested date range."""
+    try:
+        return HISTORY_STORE.analytics_counts(start_date=start_date, end_date=end_date)
+    except (TypeError, ValueError) as error:
+        raise HTTPException(400, str(error)) from error
+
+
+@app.get("/history/{item_id}")
+async def get_history_summary(item_id: str):
+    """Retrieve one compact persisted report summary."""
+    summary = HISTORY_STORE.get_report_summary(item_id)
+    if summary is None:
+        raise HTTPException(404, "History record not found")
+    return summary
+
+
 # ============================================================
 # NEW PLUGIN ENDPOINTS (Features 2, 3, 4, 8)
 # None of these modify the routes above. Each is independently
