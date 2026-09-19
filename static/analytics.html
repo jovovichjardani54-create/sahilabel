@@ -5,26 +5,26 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>SahiLabel analytics</title>
 <style>
-  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; max-width: 960px; margin: 36px auto; padding: 0 20px; background: #f8fafc; color: #1f2937; }
-  a { color: #185FA5; } .intro { color: #4b5563; }
-  .cards { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; margin: 20px 0; }
-  .card, .panel { background: #fff; border: 1px solid #e5e7eb; border-radius: 10px; padding: 16px; }
+  :root{--teal:#073c46;--green:#0b9b6c;--line:#dce8e5} *{box-sizing:border-box} body { font-family:Inter,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; max-width:1180px; margin:0 auto; padding:32px; background:#f4f8f7; color:#12303a; }
+  a { color:#087d69;font-weight:700; } .intro { color:#587079;max-width:720px; }
+  .cards { display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px;margin:24px 0; }
+  .card,.panel { background:#fff;border:1px solid var(--line);border-radius:15px;padding:19px;box-shadow:0 8px 24px rgba(20,60,55,.045); }
   .card span { color: #64748b; display: block; font-size: 13px; } .card strong { display: block; font-size: 26px; margin-top: 5px; }
   .bar-row { display: grid; grid-template-columns: 88px 1fr 42px; align-items: center; gap: 10px; margin: 12px 0; }
-  .bar { background: #e2e8f0; border-radius: 999px; height: 12px; overflow: hidden; } .fill { height: 100%; border-radius: inherit; }
-  .pass { background: #0F6E56; } .review { background: #B45309; } .violation { background: #993C1D; }
+  .bar { background:#edf3f2;border-radius:999px;height:12px;overflow:hidden; } .fill { height:100%;border-radius:inherit; }
+  .pass { background:#0b9b6c; } .review { background:#df911f; } .violation { background:#d15b4d; }
   table { width: 100%; border-collapse: collapse; } th, td { text-align: left; padding: 9px; border-bottom: 1px solid #e5e7eb; font-size: 14px; }
-  #error { color: #993C1D; } @media (max-width: 700px) { .cards { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+  h1{font-size:34px;letter-spacing:-.035em;margin-bottom:5px}.eyebrow{color:#078560;font-weight:800;font-size:12px;letter-spacing:.08em}.chart-wrap{display:grid;grid-template-columns:minmax(0,1fr) 220px;gap:25px;align-items:center}.chart-note{padding:18px;border-radius:13px;background:#eaf9f3;color:#286257;font-size:13px}#error{color:#b34030}@media(max-width:700px){body{padding:20px}.cards{grid-template-columns:repeat(2,minmax(0,1fr))}.chart-wrap{grid-template-columns:1fr}}
 </style>
 </head>
 <body>
-  <p><a href="/">← Back to label checker</a></p>
+  <p><a href="/">← Back to SahiLabel dashboard</a></p><div class="eyebrow">PERSISTENT INSPECTION RECORDS</div>
   <h1>Inspection analytics</h1>
   <p class="intro">Persistent, searchable inspection summaries. Uploaded images and generated PDFs are not stored in this dashboard.</p>
   <p id="loading">Loading analytics…</p><p id="error" role="alert"></p>
   <section id="dashboard" hidden>
     <div class="cards"><article class="card"><span>Total inspections</span><strong id="total">0</strong></article><article class="card"><span>PASS</span><strong id="passCount">0</strong></article><article class="card"><span>REVIEW</span><strong id="reviewCount">0</strong></article><article class="card"><span>VIOLATION</span><strong id="violationCount">0</strong></article></div>
-    <section class="panel"><h2>Status distribution</h2><div id="distribution"></div></section>
+    <section class="panel"><div class="chart-wrap"><div><h2>Status distribution</h2><div id="distribution"></div></div><aside class="chart-note">Counts reflect saved inspection outcomes, including final inspector decisions where a review has been resolved.</aside></div></section>
     <section class="panel"><h2>Recent inspections</h2><table><thead><tr><th>Product</th><th>Time</th><th>Status</th></tr></thead><tbody id="recent"><tr><td colspan="3">No inspections yet.</td></tr></tbody></table></section>
   </section>
 <script>
