@@ -92,6 +92,50 @@ class FieldExtractorTests(unittest.TestCase):
             self.assertIsNone(fields[key]["value"])
             self.assertTrue(fields[key]["evidence_text"])
 
+    def test_real_label_nutrition_panel_does_not_supply_product_or_net_quantity(self):
+        fields = extract_fields(words_from_lines(
+            [("Nutrition", 95), ("Facts", 95)],
+            [("Per", 95), ("100g", 95)],
+            [("Serving", 95), ("size:", 95), ("54g", 95)],
+            [("Typical", 95), ("Values", 95), ("Per", 95), ("100g", 95)],
+            [("Total", 95), ("Sugar", 95), ("4.10", 95)],
+            [("MARKETED", 95), ("BY:", 95)],
+            [("Nutri", 95), ("Being", 95), ("Pvt", 95), ("Ltd.", 95)],
+        ))
+        self.assertEqual(fields["generic_product_name"]["status"], NOT_FOUND)
+        self.assertEqual(fields["net_quantity"]["status"], NOT_FOUND)
+        self.assertEqual(fields["manufacturer_or_packer"]["value"], "Nutri Being Pvt")
+        self.assertNotIn("servings", fields["manufacturer_or_packer"]["value"].casefold())
+
+    def test_merged_net_weight_token_and_final_nine_select_net_quantity(self):
+        fields = extract_fields(words_from_lines(
+            [("BISCUMTSNETWeIGHT", 88), ("2009", 82)],
+        ))
+        self.assertEqual(fields["generic_product_name"]["value"], "BISCUITS")
+        self.assertEqual(fields["net_quantity"]["value"], "200g")
+        self.assertIn("BISCUMTSNETWeIGHT", fields["net_quantity"]["evidence_text"])
+
+    def test_mrp_ranking_rejects_nearby_unit_price(self):
+        fields = extract_fields(words_from_lines(
+            [("MRP", 95), ("50.00", 95), ("0.25", 95), ("per", 95), ("g", 95)],
+        ))
+        self.assertEqual(fields["mrp"]["value"], "50.00")
+        self.assertNotIn("0.25", fields["mrp"]["evidence_text"])
+
+    def test_invalid_numeric_date_is_not_treated_as_packing_date(self):
+        fields = extract_fields(words_from_lines(
+            [("PKD", 90), ("16/44/23", 92)],
+        ))
+        self.assertEqual(fields["manufacture_or_packing_date"]["status"], UNCERTAIN)
+        self.assertIsNone(fields["manufacture_or_packing_date"]["value"])
+
+    def test_consumer_care_can_use_contiguous_digit_fragments(self):
+        fields = extract_fields(words_from_lines(
+            [("Customer", 94), ("Care", 94), ("1800", 94), ("123", 94), ("456", 94)],
+        ))
+        self.assertEqual(fields["consumer_care"]["value"], "1800123456")
+        self.assertIn("1800", fields["consumer_care"]["evidence_text"])
+
 
 if __name__ == "__main__":
     unittest.main()
