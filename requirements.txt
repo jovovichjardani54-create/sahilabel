@@ -2,6 +2,7 @@ pytesseract
 fastapi
 uvicorn
 python-multipart
+httpx2
 reportlab
 Pillow
 opencv-python-headless
