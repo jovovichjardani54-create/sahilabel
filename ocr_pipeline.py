@@ -14,6 +14,10 @@ Team notes:
 """
 
 from typing import Any
+import os
+import re
+import time
+from threading import Lock
 
 from PIL import Image
 import pytesseract
@@ -42,6 +46,11 @@ TILE_OCR_CONFIG = "--psm 11"
 # fallback depend on it.
 _PADDLE_MODEL: Any | None = None
 _PADDLE_INITIALIZED = False
+_PADDLE_ERROR: str | None = None
+_PADDLE_LOCK = Lock()
+MAX_IMAGE_SIDE = 2600
+SMALL_TEXT_HEIGHT = 18
+MAX_PADDLE_PASSES = 3
 
 
 
@@ -145,10 +154,12 @@ def _merge_words(*word_sets: list[dict]) -> list[dict]:
                 (
                     index
                     for index, existing in enumerate(merged)
-                    if _overlap_ratio(candidate, existing) >= 0.6
-                    or (
+                    if (
                         normalized == existing["text"].casefold()
                         and _overlap_ratio(candidate, existing) >= 0.2
+                    ) or (
+                        _overlap_ratio(candidate, existing) >= 0.7
+                        and _text_similarity(normalized, existing["text"].casefold()) >= 0.75
                     )
                 ),
                 None,
@@ -162,6 +173,12 @@ def _merge_words(*word_sets: list[dict]) -> list[dict]:
             ):
                 merged[duplicate_index] = candidate
     return sorted(merged, key=lambda word: (word["top"], word["left"]))
+
+
+def _text_similarity(first: str, second: str) -> float:
+    from difflib import SequenceMatcher
+
+    return SequenceMatcher(None, first, second).ratio()
 
 
 def _tile_regions(
@@ -261,19 +278,30 @@ def _get_paddle_model() -> Any | None:
     failed optional initialisation, which avoids repeated imports/download
     attempts for every uploaded image.
     """
-    global _PADDLE_INITIALIZED, _PADDLE_MODEL
-    if _PADDLE_INITIALIZED:
-        return _PADDLE_MODEL
+    global _PADDLE_INITIALIZED, _PADDLE_MODEL, _PADDLE_ERROR
+    with _PADDLE_LOCK:
+        if _PADDLE_INITIALIZED:
+            return _PADDLE_MODEL
+        _PADDLE_INITIALIZED = True
+        try:
+            # PaddlePaddle 3.3.0 on Windows has a oneDNN conversion failure
+            # with this model.  The supported plain CPU runner was verified
+            # against real images before selecting it here.
+            os.environ.setdefault("PADDLE_PDX_ENABLE_MKLDNN_BYDEFAULT", "False")
+            from paddleocr import PaddleOCR
 
-    _PADDLE_INITIALIZED = True
-    try:
-        from paddleocr import PaddleOCR
-
-        _PADDLE_MODEL = PaddleOCR(lang="en")
-    except Exception:
-        # Paddle is an enhancement, not an availability requirement.  The
-        # caller will use the existing Tesseract pipeline instead.
-        _PADDLE_MODEL = None
+            _PADDLE_MODEL = PaddleOCR(
+                device="cpu",
+                text_detection_model_name="PP-OCRv5_mobile_det",
+                text_recognition_model_name="en_PP-OCRv5_mobile_rec",
+                use_doc_orientation_classify=False,
+                use_doc_unwarping=False,
+                use_textline_orientation=False,
+            )
+            _PADDLE_ERROR = None
+        except Exception as exc:
+            _PADDLE_MODEL = None
+            _PADDLE_ERROR = f"Paddle initialization failed: {type(exc).__name__}: {exc}"
     return _PADDLE_MODEL
 
 
@@ -316,9 +344,37 @@ def _paddle_word(item: Any, image_width: int, image_height: int) -> dict | None:
 
 
 def _paddle_result_words(result: Any, image_width: int, image_height: int) -> list[dict]:
-    """Extract recognized text lines from Paddle's documented ``ocr`` result."""
+    """Extract recognized text lines from PaddleOCR 3.x or legacy output."""
     if not isinstance(result, (list, tuple)):
         return []
+    if result and hasattr(result[0], "json"):
+        words = []
+        for page in result:
+            payload = page.json.get("res", page.json)
+            for text, score, polygon in zip(
+                payload.get("rec_texts", ()),
+                payload.get("rec_scores", ()),
+                payload.get("rec_polys", ()),
+            ):
+                points = [(float(point[0]), float(point[1])) for point in polygon]
+                if not points or not str(text).strip():
+                    continue
+                left, top = int(min(x for x, _ in points)), int(min(y for _, y in points))
+                right, bottom = int(max(x for x, _ in points)), int(max(y for _, y in points))
+                parts = list(re.finditer(r"\S+", str(text)))
+                for part in parts:
+                    # Paddle returns line polygons.  Allocate a proportional
+                    # rectangle for each token while retaining the source line.
+                    token_left = left + round((right - left) * part.start() / len(text))
+                    token_right = left + round((right - left) * part.end() / len(text))
+                    words.append({
+                        "text": part.group(), "conf": float(score) * 100,
+                        "left": token_left, "top": top,
+                        "width": max(1, token_right - token_left),
+                        "height": max(1, bottom - top),
+                        "provider": "paddle", "original_text": str(text),
+                    })
+        return _clamp_words(words, image_width, image_height)
     # The common PaddleOCR result is a list of pages, each a list of
     # ``[polygon, (text, confidence)]`` records.  Flatten pages only; never
     # merge them with a second engine's output.
@@ -344,13 +400,28 @@ def _paddle_words(image_path: str) -> list[dict]:
     model = _get_paddle_model()
     if model is None:
         return []
-    try:
-        with Image.open(image_path) as source:
-            width, height = source.size
-        result = model.ocr(image_path, cls=False)
-        return _paddle_result_words(result, width, height)
-    except Exception:
+    with Image.open(image_path) as source:
+        width, height = source.size
+    result = model.predict(image_path)
+    return _paddle_result_words(result, width, height)
+
+
+def _paddle_variant_words(image: np.ndarray, scale: float, offset: tuple[int, int] = (0, 0)) -> list[dict]:
+    """Run a bounded enhanced pass and map each box to original pixels."""
+    model = _get_paddle_model()
+    if model is None:
         return []
+    height, width = image.shape[:2]
+    words = _paddle_result_words(model.predict(image), width, height)
+    mapped = []
+    for word in words:
+        mapped.append({**word,
+            "left": offset[0] + round(word["left"] / scale),
+            "top": offset[1] + round(word["top"] / scale),
+            "width": max(1, round(word["width"] / scale)),
+            "height": max(1, round(word["height"] / scale)),
+        })
+    return mapped
 
 
 def _tesseract_words(image_path: str) -> list[dict]:
@@ -368,6 +439,22 @@ def _tesseract_words(image_path: str) -> list[dict]:
     )
 
 
+def quality_allows_ocr(quality: dict) -> bool:
+    """Resolution-only warnings may yield evidence, but never a legal PASS.
+
+    The quality decision remains REVIEW downstream. An otherwise readable
+    narrow panel should not lose all visible text simply because one image
+    dimension is below the advisory resolution threshold.
+    """
+    if quality.get("recommendation") == "PROCEED":
+        return True
+    checks = quality.get("checks") or {}
+    return bool(checks and all(
+        checks.get(name, {}).get("status") == "GOOD"
+        for name in ("blur", "brightness", "glare", "readability")
+    ) and checks.get("resolution", {}).get("status") in {"WARNING", "POOR"})
+
+
 def extract_text(image_path: str, use_preprocessing: bool = False) -> dict:
     """
     Returns:
@@ -382,18 +469,83 @@ def extract_text(image_path: str, use_preprocessing: bool = False) -> dict:
     """
     # Assess the original uploaded file before any OCR-specific image opening
     # or transformation. Review is advisory: no text is inferred as absent.
+    started = time.monotonic()
+    metadata = {"providers_used": [], "elapsed_seconds": 0.0,
+                "word_count": 0, "variants": [], "errors": [], "fallback_reasons": []}
     quality = assess_image_quality(image_path)
+    if not quality_allows_ocr(quality):
+        metadata["fallback_reasons"].append("Image quality requires review before OCR")
+        metadata["elapsed_seconds"] = round(time.monotonic() - started, 3)
+        return {"full_text": "", "words": [], "metadata": metadata}
     if quality["recommendation"] != "PROCEED":
-        return {"full_text": "", "words": []}
+        metadata["fallback_reasons"].append("Resolution-only quality review; OCR is advisory")
 
     # Paddle is primary when it is available and produces usable evidence.
     # Tesseract is called only when Paddle is unavailable, fails, or returns
     # no words; blending provider output would duplicate text and corrupt the
     # source-coordinate evidence contract.
-    words = _paddle_words(image_path)
-    if not words:
-        words = _tesseract_words(image_path)
-    return {"full_text": _words_to_text(words), "words": words}
+    words = []
+    try:
+        words = _paddle_words(image_path)
+        if words:
+            metadata["providers_used"].append("paddle")
+            metadata["variants"].append("original")
+        elif _PADDLE_ERROR:
+            metadata["errors"].append(_PADDLE_ERROR)
+    except Exception as exc:
+        metadata["errors"].append(f"Paddle inference failed: {type(exc).__name__}: {exc}")
+
+    if words and os.path.exists(image_path):
+        try:
+            source = cv2.imread(image_path)
+            if source is not None:
+                height, width = source.shape[:2]
+                median_height = sorted(word["height"] for word in words)[len(words) // 2]
+                # Small print gets one scaled and contrast-enhanced pass.
+                if (median_height < SMALL_TEXT_HEIGHT or len(words) < 25) and max(width, height) < MAX_IMAGE_SIDE:
+                    scale = min(2.0, MAX_IMAGE_SIDE / max(width, height))
+                    gray = cv2.cvtColor(source, cv2.COLOR_BGR2GRAY)
+                    enhanced = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(gray)
+                    enhanced = cv2.resize(enhanced, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+                    enhanced = cv2.cvtColor(enhanced, cv2.COLOR_GRAY2BGR)
+                    recovered = _paddle_variant_words(enhanced, scale)
+                    words = _merge_words(words, _clamp_words(recovered, width, height))
+                    metadata["variants"].append("clahe_upscaled")
+                # One additional pass on a large image's lower panel recovers
+                # dense declarations without a costly unbounded tile grid.
+                if height >= 1500 and len(metadata["variants"]) < MAX_PADDLE_PASSES:
+                    top = height // 2
+                    tile = source[top:height]
+                    recovered = _paddle_variant_words(tile, 1.0, (0, top))
+                    words = _merge_words(words, _clamp_words(recovered, width, height))
+                    metadata["variants"].append("lower_panel")
+        except Exception as exc:
+            metadata["errors"].append(f"Paddle enhancement failed: {type(exc).__name__}: {exc}")
+
+    # Recover weak or missing declarations with the established secondary
+    # provider.  Duplicate regions are resolved by geometry and confidence;
+    # distinct text at different coordinates remains available to reviewers.
+    lower_text = " ".join(word["text"] for word in words).casefold()
+    needs_recovery = (not words or len(words) < 25 or
+                      not any(marker in lower_text for marker in ("mrp", "retail price", "net weight", "net wt", "net qty")))
+    if needs_recovery:
+        metadata["fallback_reasons"].append("Paddle unavailable or declaration coverage weak")
+        try:
+            tesseract_words = [
+                {**word, "provider": "tesseract"}
+                for word in _tesseract_words(image_path)
+                if float(word.get("conf", 0)) >= 55 and
+                any(character.isalnum() for character in word.get("text", ""))
+            ]
+            if tesseract_words:
+                metadata["providers_used"].append("tesseract")
+                metadata["variants"].append("tesseract_original_enhanced_tiles")
+                words = _merge_words(words, tesseract_words)
+        except Exception as exc:
+            metadata["errors"].append(f"Tesseract failed: {type(exc).__name__}: {exc}")
+    metadata["word_count"] = len(words)
+    metadata["elapsed_seconds"] = round(time.monotonic() - started, 3)
+    return {"full_text": _words_to_text(words), "words": words, "metadata": metadata}
 
 
 if __name__ == "__main__":

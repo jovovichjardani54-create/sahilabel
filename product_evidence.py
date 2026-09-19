@@ -46,6 +46,10 @@ class DeclarationEvidence:
     image_metadata: Any
     ocr_metadata: Any
     context_score: int
+    provider: str | None = None
+    matched_marker: str | None = None
+    original_text: str = ""
+    address: str | None = None
 
     def extracted_field(self) -> dict[str, Any]:
         """Return the existing compliance checker's field-record shape."""
@@ -56,6 +60,7 @@ class DeclarationEvidence:
             "evidence_text": self.evidence_text,
             "bbox": self.bounding_box,
             "reason": self.reason,
+            "address": self.address,
         }
 
     def provenance(self) -> dict[str, Any]:
@@ -69,6 +74,11 @@ class DeclarationEvidence:
             "ocr_words": self.ocr_words,
             "image_metadata": self.image_metadata,
             "ocr_metadata": self.ocr_metadata,
+            "provider": self.provider,
+            "matched_marker": self.matched_marker,
+            "normalized_value": self.value,
+            "original_text": self.original_text,
+            "address": self.address,
         }
 
 
@@ -233,6 +243,10 @@ def _evidence_from(
         image_metadata=image.metadata,
         ocr_metadata=metadata,
         context_score=len(evidence_text.split()),
+        provider=extracted.get("provider"),
+        matched_marker=extracted.get("matched_marker"),
+        original_text=extracted.get("original_text", evidence_text),
+        address=extracted.get("address"),
     )
 
 

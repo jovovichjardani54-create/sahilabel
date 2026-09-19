@@ -58,13 +58,20 @@ def generate_pdf_report(report: dict, product_name: str, output_path: str, evide
     meta = ParagraphStyle("Meta", parent=styles["Normal"], fontSize=10, leading=14, textColor=colors.HexColor("#57534E"))
     cell = ParagraphStyle("Cell", parent=styles["BodyText"], fontSize=8, leading=10, wordWrap="CJK")
     section = ParagraphStyle("Section", parent=styles["Heading2"], fontSize=12, leading=15, textColor=colors.HexColor("#1C1917"), spaceBefore=12, spaceAfter=6)
-    overall = report.get("overall_result", "PASS" if report.get("overall_compliant") else "VIOLATION")
+    review = report.get("inspector_decision") or {}
+    overall = report.get("final_decision") or report.get("overall_result", "PASS" if report.get("overall_compliant") else "VIOLATION")
     color = STATUS_COLORS.get(overall, STATUS_COLORS["REVIEW"])
     message = _safe(report.get("decision_support_message"), "Automated result requires review where indicated.")
     elements = [Paragraph("SahiLabel", title), Paragraph("Legal Metrology Compliance Assessment", meta), Spacer(1, 5 * mm), Paragraph(f"<b>Product:</b> {_safe(product_name, 'Uploaded image')}", meta), Paragraph(f"<b>Generated:</b> {datetime.now().strftime('%d %b %Y, %H:%M')}", meta), Spacer(1, 4 * mm)]
     status = Table([[Paragraph(f"<b>Overall result: {overall}</b>", ParagraphStyle("Status", parent=styles["Heading2"], fontSize=15, leading=19, textColor=color)), Paragraph(message, cell)]], colWidths=[48 * mm, 132 * mm])
     status.setStyle(TableStyle([("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#F5F5F4")), ("BOX", (0, 0), (-1, -1), .75, color), ("VALIGN", (0, 0), (-1, -1), "MIDDLE"), ("LEFTPADDING", (0, 0), (-1, -1), 8), ("RIGHTPADDING", (0, 0), (-1, -1), 8), ("TOPPADDING", (0, 0), (-1, -1), 8), ("BOTTOMPADDING", (0, 0), (-1, -1), 8)]))
     elements.extend([status, Spacer(1, 7 * mm), Paragraph("Declaration decisions", section)])
+    if review.get("review_status") == "RESOLVED":
+        elements.insert(-1, Paragraph(
+            f"<b>Inspector decision:</b> {review['final_decision']} by {_safe(review.get('reviewer_name'))} "
+            f"({_safe(review.get('inspector_id'))}). Reason: {_safe(review.get('inspector_reason'))}. "
+            "Automated decision: REVIEW; the original field evidence remains below.", meta,
+        ))
     decisions = _decisions(report)
     table_data = [[Paragraph("<b>Declaration</b>", cell), Paragraph("<b>Rule</b>", cell), Paragraph("<b>Decision</b>", cell), Paragraph("<b>Extracted value</b>", cell), Paragraph("<b>Confidence</b>", cell)]]
     styles_to_apply = [("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#292524")), ("TEXTCOLOR", (0, 0), (-1, 0), colors.white), ("GRID", (0, 0), (-1, -1), .35, colors.HexColor("#D6D3D1")), ("VALIGN", (0, 0), (-1, -1), "TOP"), ("LEFTPADDING", (0, 0), (-1, -1), 5), ("RIGHTPADDING", (0, 0), (-1, -1), 5), ("TOPPADDING", (0, 0), (-1, -1), 5), ("BOTTOMPADDING", (0, 0), (-1, -1), 5)]

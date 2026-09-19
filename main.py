@@ -20,12 +20,13 @@ from datetime import datetime
 from fastapi import FastAPI, UploadFile, File, HTTPException, Form
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
 
-from ocr_pipeline import extract_text
+from ocr_pipeline import extract_text, quality_allows_ocr
 from report_pdf import generate_pdf_report
 from history_analytics_router import create_history_analytics_router
 from history_store import HistoryStore
-from inspector_review import create_pending_review
+from inspector_review import create_pending_review, confirm_review, get_review_status
 from inspector_review_router import router as inspector_review_router
 from product_evidence import evaluate_product_record
 from product_record import OCRResult, ProductRecord
@@ -62,8 +63,11 @@ _PLUGIN_STORE = {}  # item_id -> {"image_path": str, "ocr_words": list}
 
 def _quality_gated_ocr(image_path: str, quality: dict) -> dict:
     """Run OCR only after the already-recorded quality gate permits it."""
-    if quality.get("recommendation") != "PROCEED":
-        return {"full_text": "", "words": []}
+    if not quality_allows_ocr(quality):
+        return {"full_text": "", "words": [], "metadata": {
+            "providers_used": [], "elapsed_seconds": 0.0, "word_count": 0,
+            "variants": [], "errors": [], "fallback_reasons": ["Image quality requires review"],
+        }}
     return extract_text(image_path)
 
 
@@ -136,7 +140,8 @@ async def check_label(
             product_record.add_image(
                 normalized_label,
                 path,
-                [OCRResult(ocr_result.get("full_text", ""), ocr_result.get("words", []))],
+                [OCRResult(ocr_result.get("full_text", ""), ocr_result.get("words", []),
+                           ocr_result.get("metadata"))],
                 {"quality_assessment": quality},
             )
             image_paths.append(path)
@@ -196,6 +201,11 @@ async def check_label(
             "coverage_status": product_record.coverage_status.value,
         },
         "report": report,
+        "ocr_evidence": [
+            {"source_label": quality["label"], "full_text": result.get("full_text", ""),
+             "metadata": result.get("metadata", {})}
+            for quality, result in zip(quality_assessments, ocr_results)
+        ],
     }
     if report["overall_result"] == "REVIEW" and (inspector_id or reviewer_name):
         record["inspector_review"] = create_pending_review(
@@ -215,6 +225,8 @@ async def check_label(
         reviewer_status=(record.get("inspector_review") or {}).get("inspector_decision"),
         created_at=record["timestamp"],
     )
+    if report["overall_result"] == "REVIEW":
+        record["inspector_decision"] = HISTORY_STORE.create_pending_review(item_id, report)
     PRODUCT_RECORDS[item_id] = product_record
 
     # PLUGIN: stash what scoring/highlighting/explanations will need,
@@ -250,7 +262,8 @@ async def get_history():
     for item in HISTORY_STORE.list_recent_reports():
         active_record = active_records.get(item["product_session_id"])
         if active_record is not None:
-            history.append({key: value for key, value in active_record.items() if key != "report"})
+            history.append({key: value for key, value in active_record.items()
+                            if key not in {"report", "ocr_evidence"}})
             continue
         history.append({
             "id": item["product_session_id"],
@@ -296,7 +309,59 @@ async def get_history_summary(item_id: str):
     summary = HISTORY_STORE.get_report_summary(item_id)
     if summary is None:
         raise HTTPException(404, "History record not found")
-    return summary
+    review = HISTORY_STORE.get_inspector_decision(item_id)
+    return {**summary, "inspector_decision": review} if review else summary
+
+
+class InspectorDecisionBody(BaseModel):
+    decision: str
+    inspector_id: str
+    reviewer_name: str
+    reason: str | None = None
+
+
+@app.get("/inspector-decisions/pending")
+async def pending_inspector_decisions():
+    return {"reviews": HISTORY_STORE.list_pending_inspector_decisions()}
+
+
+@app.get("/inspector-decisions/{item_id}")
+async def inspector_decision_status(item_id: str):
+    review = HISTORY_STORE.get_inspector_decision(item_id)
+    if review is None:
+        raise HTTPException(404, "Inspector review not found")
+    return review
+
+
+@app.post("/inspector-decisions/{item_id}")
+async def decide_inspection(item_id: str, body: InspectorDecisionBody):
+    try:
+        review = HISTORY_STORE.resolve_inspector_decision(
+            item_id, body.decision, body.inspector_id, body.reviewer_name, body.reason
+        )
+    except LookupError as error:
+        raise HTTPException(404, str(error)) from error
+    except ValueError as error:
+        raise HTTPException(400, str(error)) from error
+
+    if review["review_status"] == "RESOLVED":
+        legacy = get_review_status(item_id)
+        if legacy.get("found") and legacy.get("inspector_decision") == "PENDING":
+            # Close the legacy session queue.  The durable decision above is
+            # authoritative and stores PASS/VIOLATION separately.
+            confirm_review(item_id, inspector_id=body.inspector_id,
+                           reviewer_name=body.reviewer_name, reason=body.reason)
+        record = next((item for item in HISTORY if item["id"] == item_id), None)
+        if record is not None:
+            record["overall_result"] = review["final_decision"]
+            record["overall_compliant"] = review["final_decision"] == "PASS"
+            record["inspector_decision"] = review
+            report_for_pdf = {**record["report"], "inspector_decision": review,
+                              "final_decision": review["final_decision"]}
+            evidence = _PLUGIN_STORE.get(item_id, {}).get("annotated_image_path")
+            generate_pdf_report(report_for_pdf, record["filename"],
+                                os.path.join(REPORT_DIR, f"{item_id}.pdf"), evidence)
+    return review
 
 
 # ============================================================

@@ -114,18 +114,15 @@ function scoreSummary(itemId, overallResult) {
 }
 
 function reviewPanel(itemId, review) {
-  if (!review?.found && !review?.created && !review?.review_id) {
-    return '<section class="inspector-panel"><h3>Inspector review</h3><p>This result needs review. Enter an inspector ID and reviewer name before checking an image to create an auditable pending review.</p></section>';
-  }
-  const status = review.inspector_decision || 'PENDING';
-  const completed = status !== 'PENDING';
-  return `<section class="inspector-panel" id="inspectorReview"><h3>Inspector review</h3><p><strong>Review ID:</strong> ${escapeHtml(review.review_id || itemId)} · <strong>Status:</strong> <span id="reviewStatus">${escapeHtml(status)}</span></p><p>${completed ? 'The original automated decision is preserved in the review audit trail.' : 'Confirm after checking the physical package, or override with a reason.'}</p>${completed ? '' : '<label>Review reason (required to override)<textarea id="reviewReason" rows="2" placeholder="State why an override is needed"></textarea></label><div class="review-actions"><button type="button" id="confirmReview">Confirm review</button><button type="button" class="secondary" id="overrideReview">Override with reason</button></div><p id="reviewMessage" aria-live="polite"></p>'}</section>`;
+  if (!review?.review_id) return '<section class="inspector-panel"><h3>Inspector review</h3><p>Review details are temporarily unavailable.</p></section>';
+  const completed = review.review_status === 'RESOLVED';
+  return `<section class="inspector-panel" id="inspectorReview"><h3>Inspector review</h3><p><strong>Review ID:</strong> ${escapeHtml(review.review_id || itemId)} · <strong>Status:</strong> ${escapeHtml(review.review_status)}</p><p><strong>Automated decision:</strong> ${escapeHtml(review.automated_decision)}</p>${completed ? `<p><strong>Inspector decision:</strong> ${escapeHtml(review.final_decision)} · ${escapeHtml(review.inspector_reason)}</p>` : '<p>Check the physical package before recording a final decision.</p><label>Inspector reason (required for PASS or VIOLATION)<textarea id="reviewReason" rows="2" placeholder="Describe the physical evidence"></textarea></label><div class="review-actions"><button type="button" id="approveReview">Approve as PASS</button><button type="button" class="secondary" id="violateReview">Mark as VIOLATION</button><button type="button" class="secondary" id="retainReview">Keep in REVIEW</button></div><p id="reviewMessage" aria-live="polite"></p>'}</section>`;
 }
 
 async function fetchReview(itemId, suppliedReview) {
   if (suppliedReview) return suppliedReview;
   try {
-    const response = await fetch(`/inspector-reviews/${encodeURIComponent(itemId)}`);
+    const response = await fetch(`/inspector-decisions/${encodeURIComponent(itemId)}`);
     return response.ok ? await response.json() : null;
   } catch (_) { return null; }
 }
@@ -135,21 +132,30 @@ async function renderReviewPanel(itemId, suppliedReview) {
   const result = document.getElementById('result');
   if (!result || result.dataset.itemId !== itemId) return;
   result.insertAdjacentHTML('beforeend', reviewPanel(itemId, review));
-  document.getElementById('confirmReview')?.addEventListener('click', () => submitReview(itemId, 'confirm'));
-  document.getElementById('overrideReview')?.addEventListener('click', () => submitReview(itemId, 'override'));
+  document.getElementById('approveReview')?.addEventListener('click', () => submitReview(itemId, 'PASS'));
+  document.getElementById('violateReview')?.addEventListener('click', () => submitReview(itemId, 'VIOLATION'));
+  document.getElementById('retainReview')?.addEventListener('click', () => submitReview(itemId, 'REVIEW'));
 }
 
-async function submitReview(itemId, action) {
+async function submitReview(itemId, decision) {
   const inspectorId = document.getElementById('inspectorId').value.trim();
   const reviewerName = document.getElementById('reviewerName').value.trim();
   const reason = document.getElementById('reviewReason')?.value.trim() || '';
   const message = document.getElementById('reviewMessage');
   if (!inspectorId || !reviewerName) { message.textContent = 'Inspector ID and reviewer name are required.'; return; }
-  if (action === 'override' && !reason) { message.textContent = 'An override reason is required.'; return; }
-  const response = await fetch(`/inspector-reviews/${encodeURIComponent(itemId)}/${action}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ inspector_id: inspectorId, reviewer_name: reviewerName, reason }) });
+  if (decision !== 'REVIEW' && !reason) { message.textContent = 'A reason is required for a final inspector decision.'; return; }
+  const response = await fetch(`/inspector-decisions/${encodeURIComponent(itemId)}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ decision, inspector_id: inspectorId, reviewer_name: reviewerName, reason }) });
   const payload = await response.json();
   if (!response.ok) { message.textContent = payload.detail || payload.error || 'Review update failed.'; return; }
   document.getElementById('inspectorReview').outerHTML = reviewPanel(itemId, payload);
+  if (payload.review_status === 'RESOLVED') {
+    document.getElementById('finalDecision').innerHTML = `<strong>Final decision: ${escapeHtml(payload.final_decision)}</strong> — Decided by inspector ${escapeHtml(payload.reviewer_name)}. Automated score: pending/incomplete.`;
+    loadHistory();
+  } else {
+    document.getElementById('approveReview')?.addEventListener('click', () => submitReview(itemId, 'PASS'));
+    document.getElementById('violateReview')?.addEventListener('click', () => submitReview(itemId, 'VIOLATION'));
+    document.getElementById('retainReview')?.addEventListener('click', () => submitReview(itemId, 'REVIEW'));
+  }
 }
 
 const renderResultWithEvidence = renderResult;
@@ -159,11 +165,13 @@ renderResult = function(data) {
   const overallResult = report.overall_result || (report.overall_compliant ? 'PASS' : 'VIOLATION');
   const result = document.getElementById('result');
   result.dataset.itemId = data.id;
+  const evidence = (data.ocr_evidence || []).map((source) => `<section><h4>${escapeHtml(source.source_label)}</h4><p>Providers: ${escapeHtml((source.metadata?.providers_used || []).join(', ') || 'none')} · ${escapeHtml(source.metadata?.elapsed_seconds, '0')} s · ${escapeHtml(source.metadata?.word_count, '0')} words</p><pre style="white-space:pre-wrap;overflow-wrap:anywhere">${escapeHtml(source.full_text, 'No text recognized')}</pre></section>`).join('');
+  result.insertAdjacentHTML('beforeend', `<p id="finalDecision"></p><details><summary>Raw OCR evidence</summary>${evidence || '<p>No OCR evidence available.</p>'}</details>`);
   const legacyScore = document.getElementById('scoreDisplay');
   if (legacyScore) legacyScore.id = 'legacyScoreDisplay';
   document.getElementById('legacyScoreDisplay')?.parentElement.replaceWith(Object.assign(document.createElement('div'), { id: 'scoreSummary' }));
   scoreSummary(data.id, overallResult);
-  if (overallResult === 'REVIEW') renderReviewPanel(data.id, data.inspector_review);
+  if (overallResult === 'REVIEW') renderReviewPanel(data.id, data.inspector_decision);
 };
 </script>
 </body>

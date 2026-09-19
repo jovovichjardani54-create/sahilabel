@@ -181,6 +181,89 @@ class FieldExtractorTests(unittest.TestCase):
         self.assertEqual(fields["consumer_care"]["value"], "1800123456")
         self.assertIn("1800", fields["consumer_care"]["evidence_text"])
 
+    def test_nutrition_column_cannot_borrow_net_or_mrp_heading_to_its_right(self):
+        ocr = words_from_lines(
+            [("Energy", 91), ("160", 94), ("kcal", 91),
+             ("Net", 94), ("Weight", 94), ("250g", 91),
+             ("MRP", 91), ("Rs.600.00", 92)],
+            [("Fat", 90), ("1.5g", 95)],
+        )
+        fields = extract_fields(ocr)
+        self.assertEqual(fields["net_quantity"]["value"], "250g")
+        self.assertEqual(fields["net_quantity"]["status"], FOUND)
+        self.assertEqual(fields["mrp"]["value"], "Rs.600.00")
+        self.assertEqual(fields["mrp"]["status"], FOUND)
+
+    def test_ingredient_word_does_not_beat_product_title(self):
+        fields = extract_fields(words_from_lines(
+            [("CALIFORNIA", 90), ("PISTACHIOS", 79)],
+            [("Ingredients:", 94), ("Pistachios,", 95), ("Salt", 99)],
+        ))
+        self.assertEqual(fields["generic_product_name"]["value"], "PISTACHIOS")
+
+    def test_unmarked_quantity_is_uncertain_not_compliant(self):
+        fields = extract_fields(words_from_lines([("250g", 92)]))
+        self.assertEqual(fields["net_quantity"]["status"], UNCERTAIN)
+
+    def test_date_and_regulatory_context_are_not_product_names(self):
+        fields = extract_fields(words_from_lines(
+            [("PKD", 96), ("04/2025", 96)],
+            [("MRP", 96), ("FSSAI", 96), ("Licence", 96)],
+        ))
+        self.assertEqual(fields["generic_product_name"]["status"], NOT_FOUND)
+
+    def test_unrelated_similar_ocr_word_is_not_a_commodity(self):
+        fields = extract_fields(words_from_lines(
+            [("Recommended", 96), ("average", 96), ("adult", 96)],
+        ))
+        self.assertEqual(fields["generic_product_name"]["status"], NOT_FOUND)
+
+    def test_barcode_digits_near_care_heading_are_not_a_contact(self):
+        fields = extract_fields(words_from_lines(
+            [("Customer", 95), ("Care", 95)],
+            [("9014600363", 98)],
+        ))
+        self.assertEqual(fields["consumer_care"]["status"], UNCERTAIN)
+        self.assertIsNone(fields["consumer_care"]["value"])
+
+    def test_drained_quantity_cannot_beat_net_quantity(self):
+        fields = extract_fields(words_from_lines(
+            [("NET", 95), ("QUANTITY", 95), ("450g", 95)],
+            [("DRAINED", 95), ("QUANTITY", 95), ("212g", 98)],
+        ))
+        self.assertEqual(fields["net_quantity"]["value"], "450g")
+
+    def test_separate_drained_heading_cannot_beat_net_quantity(self):
+        fields = extract_fields(words_from_lines(
+            [("NET", 95), ("QUANTITY", 95), ("450g", 95)],
+            [("DRAINED", 95)],
+            [("212g", 98)],
+        ))
+        self.assertEqual(fields["net_quantity"]["value"], "450g")
+
+    def test_malformed_three_digit_year_is_not_a_packing_date(self):
+        fields = extract_fields(words_from_lines([("Mfg", 95), ("Date", 95), ("04/225", 96)]))
+        self.assertEqual(fields["manufacture_or_packing_date"]["status"], UNCERTAIN)
+        self.assertIsNone(fields["manufacture_or_packing_date"]["value"])
+
+    def test_manufacturer_does_not_absorb_nutrition_column(self):
+        fields = extract_fields(words_from_lines(
+            [("Marketed", 96), ("By", 96)],
+            [("Nutrition", 96), ("Foods", 96), ("Pvt", 96), ("Ltd", 96)],
+            [("Acme", 96), ("Foods", 96), ("Pvt", 96), ("Ltd", 96)],
+        ))
+        manufacturer = fields["manufacturer_or_packer"]
+        self.assertIn("Acme", manufacturer["value"])
+        self.assertNotIn("Nutrition", manufacturer["value"])
+
+    def test_unlabelled_nearby_street_is_not_consumer_care_address(self):
+        fields = extract_fields(words_from_lines(
+            [("Customer", 96), ("Care", 96)],
+            [("Bharuch", 96), ("Road", 96), ("Gujarat", 96)],
+        ))
+        self.assertEqual(fields["consumer_care"]["status"], UNCERTAIN)
+        self.assertIsNone(fields["consumer_care"]["value"])
+
 
 if __name__ == "__main__":
     unittest.main()

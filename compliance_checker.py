@@ -85,6 +85,7 @@ def check_extracted_fields(
             "extracted_value": extracted["value"], "confidence": extracted["confidence"],
             "evidence_text": extracted["evidence_text"], "bbox": extracted["bbox"],
             "reason": reason,
+            "address": extracted.get("address"),
         }
         if source_evidence and field_key in source_evidence:
             decisions[field_key]["source_evidence"] = dict(source_evidence[field_key])

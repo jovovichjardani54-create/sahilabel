@@ -70,6 +70,24 @@ class HistoryStore:
                 ON report_history (product_name)
                 """
             )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS inspector_decisions (
+                    product_session_id TEXT PRIMARY KEY,
+                    automated_decision TEXT NOT NULL,
+                    automated_reasons TEXT NOT NULL,
+                    review_status TEXT NOT NULL,
+                    inspector_decision TEXT,
+                    inspector_id TEXT,
+                    reviewer_name TEXT,
+                    inspector_reason TEXT,
+                    reviewed_at TEXT,
+                    final_decision TEXT NOT NULL,
+                    audit_trail TEXT NOT NULL,
+                    FOREIGN KEY(product_session_id) REFERENCES report_history(product_session_id)
+                )
+                """
+            )
 
     def save_report(
         self,
@@ -220,6 +238,83 @@ class HistoryStore:
         """Return a previously saved compact summary, or ``None`` if absent."""
         return self.get_report(product_session_id)
 
+    def create_pending_review(self, product_session_id: str, report: dict[str, Any]) -> dict[str, Any]:
+        """Record the machine REVIEW and its reasons independently of the final result."""
+        if report.get("overall_result") != "REVIEW":
+            raise ValueError("Only an automated REVIEW can create a pending review")
+        reasons = {
+            key: decision.get("reason", "")
+            for key, decision in report.get("field_decisions", {}).items()
+            if decision.get("status") == "REVIEW"
+        }
+        with self._connection() as connection:
+            connection.execute(
+                """INSERT OR IGNORE INTO inspector_decisions
+                (product_session_id, automated_decision, automated_reasons, review_status,
+                 final_decision, audit_trail) VALUES (?, 'REVIEW', ?, 'PENDING', 'REVIEW', '[]')""",
+                (product_session_id, json.dumps(reasons, sort_keys=True)),
+            )
+        return self.get_inspector_decision(product_session_id) or {}
+
+    def get_inspector_decision(self, product_session_id: str) -> dict[str, Any] | None:
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM inspector_decisions WHERE product_session_id = ?",
+                (product_session_id,),
+            ).fetchone()
+        return _row_to_inspector_decision(row) if row else None
+
+    def list_pending_inspector_decisions(self) -> list[dict[str, Any]]:
+        with self._connection() as connection:
+            rows = connection.execute(
+                "SELECT * FROM inspector_decisions WHERE review_status = 'PENDING' ORDER BY product_session_id"
+            ).fetchall()
+        return [_row_to_inspector_decision(row) for row in rows]
+
+    def resolve_inspector_decision(
+        self, product_session_id: str, decision: str, inspector_id: str,
+        reviewer_name: str, reason: str | None = None,
+    ) -> dict[str, Any]:
+        """Resolve or retain REVIEW atomically with the searchable final status."""
+        final = str(decision or "").strip().upper()
+        if final not in {"PASS", "VIOLATION", "REVIEW"}:
+            raise ValueError("inspector decision must be PASS, VIOLATION, or REVIEW")
+        identity = str(inspector_id or "").strip()
+        reviewer = str(reviewer_name or "").strip()
+        explanation = str(reason or "").strip()
+        if not identity or not reviewer:
+            raise ValueError("inspector ID and reviewer name are required")
+        if final != "REVIEW" and not explanation:
+            raise ValueError("a reason is required for PASS or VIOLATION")
+        reviewed_at = datetime.now(timezone.utc).isoformat()
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM inspector_decisions WHERE product_session_id = ?",
+                (product_session_id,),
+            ).fetchone()
+            if row is None:
+                raise LookupError("pending inspector review not found")
+            if row["review_status"] != "PENDING":
+                raise ValueError("inspector review is already resolved")
+            audit = json.loads(row["audit_trail"])
+            audit.append({"action": "retain_review" if final == "REVIEW" else "resolve",
+                          "decision": final, "inspector_id": identity,
+                          "reviewer_name": reviewer, "reason": explanation,
+                          "reviewed_at": reviewed_at})
+            connection.execute(
+                """UPDATE inspector_decisions SET review_status = ?, inspector_decision = ?,
+                inspector_id = ?, reviewer_name = ?, inspector_reason = ?, reviewed_at = ?,
+                final_decision = ?, audit_trail = ? WHERE product_session_id = ?""",
+                ("PENDING" if final == "REVIEW" else "RESOLVED",
+                 None if final == "REVIEW" else final, identity, reviewer,
+                 explanation, reviewed_at, final, json.dumps(audit), product_session_id),
+            )
+            connection.execute(
+                "UPDATE report_history SET overall_result = ?, reviewer_status = ? WHERE product_session_id = ?",
+                (final, "PENDING" if final == "REVIEW" else "RESOLVED", product_session_id),
+            )
+        return self.get_inspector_decision(product_session_id) or {}
+
     def analytics_counts(
         self,
         start_date: str | None = None,
@@ -317,6 +412,22 @@ def _row_to_report(row: sqlite3.Row) -> dict[str, Any]:
         "overall_result": row["overall_result"],
         "field_decision_summary": json.loads(row["field_decision_summary"]),
         "reviewer_status": row["reviewer_status"],
+    }
+
+
+def _row_to_inspector_decision(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "review_id": row["product_session_id"],
+        "automated_decision": row["automated_decision"],
+        "automated_reasons": json.loads(row["automated_reasons"]),
+        "review_status": row["review_status"],
+        "inspector_decision": row["inspector_decision"],
+        "inspector_id": row["inspector_id"],
+        "reviewer_name": row["reviewer_name"],
+        "inspector_reason": row["inspector_reason"],
+        "reviewed_at": row["reviewed_at"],
+        "final_decision": row["final_decision"],
+        "audit_trail": json.loads(row["audit_trail"]),
     }
 
 
