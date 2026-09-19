@@ -134,18 +134,30 @@ class HistoryStore:
 
     def list_recent_reports(self, limit: int = 50) -> list[dict[str, Any]]:
         """Return newest report summaries first."""
+        return self.list_reports(limit=limit)
+
+    def list_reports(
+        self,
+        query: str | None = None,
+        overall_result: str | None = None,
+        start_date: str | None = None,
+        end_date: str | None = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> list[dict[str, Any]]:
+        """List compact summaries with search, filters, and safe pagination."""
         limit = _valid_limit(limit)
+        offset = _valid_offset(offset)
+        clauses, parameters = _report_filters(
+            query, overall_result, start_date, end_date
+        )
+        sql = _report_select()
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+        sql += " ORDER BY created_at DESC, product_session_id DESC LIMIT ? OFFSET ?"
+        parameters.extend((limit, offset))
         with self._connection() as connection:
-            rows = connection.execute(
-                """
-                SELECT product_session_id, filename, created_at, overall_result,
-                       product_name, field_decision_summary, reviewer_status
-                FROM report_history
-                ORDER BY created_at DESC, product_session_id DESC
-                LIMIT ?
-                """,
-                (limit,),
-            ).fetchall()
+            rows = connection.execute(sql, parameters).fetchall()
         return [_row_to_report(row) for row in rows]
 
     def search_reports(
@@ -161,39 +173,30 @@ class HistoryStore:
         Dates accept ISO timestamps or ``YYYY-MM-DD`` values.  A date-only
         end date includes the whole calendar day.
         """
-        limit = _valid_limit(limit)
-        clauses: list[str] = []
-        parameters: list[Any] = []
-        if filename_query:
-            clauses.append(
-                "(filename LIKE ? COLLATE NOCASE OR product_name LIKE ? COLLATE NOCASE "
-                "OR product_session_id LIKE ? COLLATE NOCASE)"
-            )
-            query_text = f"%{filename_query}%"
-            parameters.extend((query_text, query_text, query_text))
-        if overall_result:
-            overall_result = _valid_result(overall_result)
-            clauses.append("overall_result = ? COLLATE NOCASE")
-            parameters.append(overall_result)
-        if start_date:
-            clauses.append("created_at >= ?")
-            parameters.append(_date_boundary(start_date, is_end=False))
-        if end_date:
-            clauses.append("created_at <= ?")
-            parameters.append(_date_boundary(end_date, is_end=True))
-
-        query = (
-            "SELECT product_session_id, filename, product_name, created_at, overall_result, "
-            "field_decision_summary, reviewer_status FROM report_history"
+        return self.list_reports(
+            query=filename_query,
+            overall_result=overall_result,
+            start_date=start_date,
+            end_date=end_date,
+            limit=limit,
         )
-        if clauses:
-            query += " WHERE " + " AND ".join(clauses)
-        query += " ORDER BY created_at DESC, product_session_id DESC LIMIT ?"
-        parameters.append(limit)
 
+    def count_reports(
+        self,
+        query: str | None = None,
+        overall_result: str | None = None,
+        start_date: str | None = None,
+        end_date: str | None = None,
+    ) -> int:
+        """Count summaries matching the same filters as ``list_reports``."""
+        clauses, parameters = _report_filters(
+            query, overall_result, start_date, end_date
+        )
+        sql = "SELECT COUNT(*) AS count FROM report_history"
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
         with self._connection() as connection:
-            rows = connection.execute(query, parameters).fetchall()
-        return [_row_to_report(row) for row in rows]
+            return connection.execute(sql, parameters).fetchone()["count"]
 
     def get_report(self, product_session_id: str) -> dict[str, Any] | None:
         """Return one report summary, or ``None`` when it does not exist."""
@@ -219,14 +222,7 @@ class HistoryStore:
         end_date: str | None = None,
     ) -> dict[str, int]:
         """Return PASS, REVIEW, and VIOLATION totals, including zeroes."""
-        clauses: list[str] = []
-        parameters: list[Any] = []
-        if start_date:
-            clauses.append("created_at >= ?")
-            parameters.append(_date_boundary(start_date, is_end=False))
-        if end_date:
-            clauses.append("created_at <= ?")
-            parameters.append(_date_boundary(end_date, is_end=True))
+        clauses, parameters = _report_filters(None, None, start_date, end_date)
         query = "SELECT overall_result, COUNT(*) AS count FROM report_history"
         if clauses:
             query += " WHERE " + " AND ".join(clauses)
@@ -238,6 +234,45 @@ class HistoryStore:
             if row["overall_result"] in counts:
                 counts[row["overall_result"]] = row["count"]
         return counts
+
+    def analytics_summary(
+        self,
+        start_date: str | None = None,
+        end_date: str | None = None,
+        trend_days: int = 7,
+    ) -> dict[str, Any]:
+        """Return persistent totals, rates, and daily status trends."""
+        trend_days = _valid_trend_days(trend_days)
+        clauses, parameters = _report_filters(None, None, start_date, end_date)
+        counts = self.analytics_counts(start_date=start_date, end_date=end_date)
+        total = sum(counts.values())
+        trend_sql = (
+            "SELECT substr(created_at, 1, 10) AS date, overall_result, COUNT(*) AS count "
+            "FROM report_history"
+        )
+        if clauses:
+            trend_sql += " WHERE " + " AND ".join(clauses)
+        trend_sql += " GROUP BY date, overall_result ORDER BY date DESC LIMIT ?"
+        with self._connection() as connection:
+            rows = connection.execute(trend_sql, [*parameters, trend_days * 3]).fetchall()
+        by_date: dict[str, dict[str, int]] = {}
+        for row in rows:
+            bucket = by_date.setdefault(
+                row["date"], {"PASS": 0, "REVIEW": 0, "VIOLATION": 0}
+            )
+            if row["overall_result"] in bucket:
+                bucket[row["overall_result"]] = row["count"]
+        daily_trends = [
+            {"date": date, "counts": counts_for_day, "total": sum(counts_for_day.values())}
+            for date, counts_for_day in sorted(by_date.items(), reverse=True)[:trend_days]
+        ]
+        return {
+            "total_inspections": total,
+            "counts": counts,
+            "review_rate": counts["REVIEW"] / total if total else 0.0,
+            "violation_rate": counts["VIOLATION"] / total if total else 0.0,
+            "daily_trends": daily_trends,
+        }
 
 
 def _field_decision_summary(report: dict[str, Any]) -> dict[str, str]:
@@ -264,9 +299,21 @@ def _row_to_report(row: sqlite3.Row) -> dict[str, Any]:
 
 
 def _valid_limit(limit: int) -> int:
-    if not isinstance(limit, int) or isinstance(limit, bool) or limit < 1:
-        raise ValueError("limit must be a positive integer")
+    if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 100:
+        raise ValueError("limit must be an integer from 1 to 100")
     return limit
+
+
+def _valid_offset(offset: int) -> int:
+    if not isinstance(offset, int) or isinstance(offset, bool) or not 0 <= offset <= 10000:
+        raise ValueError("offset must be an integer from 0 to 10000")
+    return offset
+
+
+def _valid_trend_days(trend_days: int) -> int:
+    if not isinstance(trend_days, int) or isinstance(trend_days, bool) or not 1 <= trend_days <= 90:
+        raise ValueError("trend_days must be an integer from 1 to 90")
+    return trend_days
 
 
 def _valid_result(result: str) -> str:
@@ -286,3 +333,41 @@ def _date_boundary(value: str, is_end: bool) -> str:
     if len(value) == 10:
         return f"{value}T23:59:59.999999+00:00" if is_end else f"{value}T00:00:00+00:00"
     return parsed.isoformat()
+
+
+def _report_select() -> str:
+    return (
+        "SELECT product_session_id, filename, product_name, created_at, overall_result, "
+        "field_decision_summary, reviewer_status FROM report_history"
+    )
+
+
+def _report_filters(
+    query: str | None,
+    overall_result: str | None,
+    start_date: str | None,
+    end_date: str | None,
+) -> tuple[list[str], list[Any]]:
+    clauses: list[str] = []
+    parameters: list[Any] = []
+    if query:
+        clauses.append(
+            "(filename LIKE ? COLLATE NOCASE OR product_name LIKE ? COLLATE NOCASE "
+            "OR product_session_id LIKE ? COLLATE NOCASE)"
+        )
+        query_text = f"%{query}%"
+        parameters.extend((query_text, query_text, query_text))
+    if overall_result:
+        clauses.append("overall_result = ? COLLATE NOCASE")
+        parameters.append(_valid_result(overall_result))
+    start_boundary = _date_boundary(start_date, is_end=False) if start_date else None
+    end_boundary = _date_boundary(end_date, is_end=True) if end_date else None
+    if start_boundary and end_boundary and start_boundary > end_boundary:
+        raise ValueError("start_date must not be after end_date")
+    if start_boundary:
+        clauses.append("created_at >= ?")
+        parameters.append(start_boundary)
+    if end_boundary:
+        clauses.append("created_at <= ?")
+        parameters.append(end_boundary)
+    return clauses, parameters
