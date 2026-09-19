@@ -1,4 +1,6 @@
 .venv/
+.venv311/
+validation_samples/
 venv/
 __pycache__/
 *.py[cod]

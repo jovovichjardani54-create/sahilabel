@@ -131,6 +131,46 @@ class HistoryStoreTests(unittest.TestCase):
         self.assertEqual(self.store.search_reports("nothing"), [])
         self.assertEqual(self.store.analytics_counts(), {"PASS": 0, "REVIEW": 0, "VIOLATION": 0})
 
+    def test_inspector_retains_review_then_resolves_pass_with_audit_and_restart(self):
+        machine = report("REVIEW", mrp="REVIEW")
+        machine["field_decisions"]["mrp"]["reason"] = "OCR did not recover price"
+        self.store.save_report("inspection-1", "label.png", machine)
+        pending = self.store.create_pending_review("inspection-1", machine)
+        self.assertEqual(pending["automated_decision"], "REVIEW")
+        self.assertEqual(pending["automated_reasons"]["mrp"], "OCR did not recover price")
+        self.store.resolve_inspector_decision("inspection-1", "REVIEW", "ins-1", "Reviewer")
+        self.assertEqual(len(self.store.list_pending_inspector_decisions()), 1)
+        resolved = self.store.resolve_inspector_decision(
+            "inspection-1", "PASS", "ins-1", "Reviewer", "Verified declaration on physical package"
+        )
+        self.assertEqual(resolved["review_status"], "RESOLVED")
+        self.assertEqual(resolved["automated_decision"], "REVIEW")
+        self.assertEqual(len(resolved["audit_trail"]), 2)
+        reopened = HistoryStore(self.database_path)
+        self.assertEqual(reopened.get_inspector_decision("inspection-1")["final_decision"], "PASS")
+        self.assertEqual(reopened.list_pending_inspector_decisions(), [])
+        self.assertEqual(reopened.analytics_counts()["PASS"], 1)
+        self.assertEqual(reopened.search_reports(overall_result="PASS")[0]["product_session_id"], "inspection-1")
+        with self.assertRaises(ValueError):
+            reopened.resolve_inspector_decision("inspection-1", "VIOLATION", "ins-1", "Reviewer", "Changed")
+
+    def test_inspector_violation_and_required_identity_reason(self):
+        machine = report("REVIEW", net_quantity="REVIEW")
+        self.store.save_report("inspection-2", "label.png", machine)
+        self.store.create_pending_review("inspection-2", machine)
+        for inspector_id, reviewer_name, reason in (("", "Reviewer", "reason"),
+                                                    ("ins-2", "", "reason"),
+                                                    ("ins-2", "Reviewer", "")):
+            with self.assertRaises(ValueError):
+                self.store.resolve_inspector_decision(
+                    "inspection-2", "VIOLATION", inspector_id, reviewer_name, reason
+                )
+        resolved = self.store.resolve_inspector_decision(
+            "inspection-2", "VIOLATION", "ins-2", "Reviewer", "Physically absent declaration"
+        )
+        self.assertEqual(resolved["final_decision"], "VIOLATION")
+        self.assertEqual(self.store.analytics_counts(), {"PASS": 0, "REVIEW": 0, "VIOLATION": 1})
+
     def test_uses_reviewer_status_from_report_when_present(self):
         saved = self.store.save_report(
             "session-2",
