@@ -29,7 +29,11 @@ SERVING_RE = re.compile(
     r"\bnutrition\b|\benergy\b|\bunit\s*price\b",
     re.I,
 )
-DATE_MARKER_RE = re.compile(r"\b(?:date\w*\s*(?:of\s*)?(?:packing|packaging)|packed\s*on|pkd)\b", re.I)
+DATE_MARKER_RE = re.compile(
+    r"\b(?:date\w*\s*(?:of\s*)?(?:packing|packaging)|packed\s*on|"
+    r"pkd|mfd|mfg|manufactured(?:\s*on)?)\b",
+    re.I,
+)
 ENTITY_TERMS = {"industries", "foods", "private", "pvt", "limited", "ltd", "llp", "lt"}
 NUTRITION_TERMS = {"sugar", "protein", "carbohydrate", "carbohydrates"}
 
@@ -238,20 +242,32 @@ def _extract_product(words: list[dict], lines: list[list[dict]]) -> dict:
             if close_terms:
                 candidate = max(close_terms, key=lambda term: SequenceMatcher(None, segment, term).ratio())
         if candidate:
-            occurrences.setdefault(candidate, []).append(word)
+            occurrences.setdefault(candidate, []).append([word])
+    for term in terms:
+        if " " not in term:
+            continue
+        phrase = re.compile(r"\b" + r"[\s-]+".join(map(re.escape, term.split())) + r"\b", re.I)
+        for line in lines:
+            for match in phrase.finditer(_line_text(line)):
+                evidence = _matching_words(line, match)
+                if evidence:
+                    occurrences.setdefault(term, []).append(evidence)
     if occurrences:
         heights = sorted(word["height"] for word in words) or [1]
         median_height = heights[len(heights) // 2] or 1
         net_markers = _net_markers(words, lines)
         ranked = []
-        for term, matches in occurrences.items():
-            best_word = max(matches, key=lambda word: float(word["conf"]))
+        for term, match_groups in occurrences.items():
+            matches = [word for group in match_groups for word in group]
+            best_group = max(match_groups, key=_confidence)
+            best_word = max(best_group, key=lambda word: float(word["conf"]))
             index, line = _line_for_word(lines, best_word)
             context_lines = lines[max(0, index - 1):index + 2] if index >= 0 else [[best_word]]
             context = " ".join(_line_text(item) for item in context_lines).casefold()
             candidate_line = _line_text(line).casefold() if line else best_word["text"].casefold()
             score = float(best_word["conf"]) + min(25, best_word["height"] / median_height * 10)
-            score += min(24, (len(matches) - 1) * 12)
+            score += min(24, (len(match_groups) - 1) * 12)
+            score += 30 * (len(term.split()) - 1)
             if "ingredient" in context:
                 score += 18
             distance = _marker_distance(matches, net_markers)
@@ -266,12 +282,12 @@ def _extract_product(words: list[dict], lines: list[list[dict]]) -> dict:
                 # weaker nutrition candidate when no title is visible.
                 score -= 120
             else:
-                ranked.append((score, term, best_word, len(matches)))
+                ranked.append((score, term, best_group, len(match_groups)))
         if not ranked:
             return _empty("Configured commodity words were found only in nutrition context, not as a product declaration.")
-        _, term, best_word, repetitions = max(ranked, key=lambda item: item[0])
+        _, term, best_evidence, repetitions = max(ranked, key=lambda item: item[0])
         return _result(
-            term.upper(), FOUND, [best_word],
+            term.upper(), FOUND, best_evidence,
             "Selected the highest-ranked configurable commodity using OCR confidence, prominence, repetition, declaration proximity, and nutrition-context penalties"
             f" ({repetitions} occurrence{'s' if repetitions != 1 else ''}).",
         )
@@ -329,10 +345,38 @@ def _is_price(word: dict) -> bool:
     return bool(re.fullmatch(r"(?:₹|rs\.?|inr)?\s*\d{1,5}\.\d{2}", token, re.I)) and "/" not in token
 
 
+def _has_currency_marker(word: dict) -> bool:
+    return bool(re.match(r"(?:₹|rs\.?|inr)\s*\d", word["text"].strip(), re.I))
+
+
+def _is_unit_price(word: dict, line: list[dict]) -> bool:
+    token = word["text"].strip().casefold()
+    if "/" in token:
+        return True
+    ordered = sorted(line, key=lambda candidate: candidate["left"])
+    try:
+        index = next(index for index, candidate in enumerate(ordered) if candidate is word)
+    except StopIteration:
+        return False
+    suffix = " ".join(candidate["text"] for candidate in ordered[index + 1:index + 4])
+    return bool(re.match(r"\s*(?:per\b|/)\s*(?:g|kg|ml|l)\b", suffix, re.I))
+
+
 def _extract_mrp(words: list[dict], lines: list[list[dict]]) -> dict:
     marker_words = [w for w in words if "mrp" in re.sub(r"[^a-z]", "", w["text"].casefold())]
     if not marker_words:
-        return _empty("No MRP marker or OCR variant was detected.")
+        currency_prices = []
+        for word in words:
+            if not (_is_price(word) and _has_currency_marker(word)):
+                continue
+            _, line = _line_for_word(lines, word)
+            if not _is_unit_price(word, line) and float(word["conf"]) >= 70:
+                currency_prices.append((word, line))
+        if not currency_prices:
+            return _empty("No MRP marker or reliable non-unit currency price was detected.")
+        price, _ = max(currency_prices, key=lambda item: float(item[0]["conf"]))
+        return _result(price["text"].strip(), UNCERTAIN, [price],
+                       "A non-unit currency price was detected without a reliable MRP marker; it is retained as review evidence and not treated as a legal MRP declaration.")
     candidates = [w for w in words if _is_price(w)]
     candidates = [w for w in candidates if any(
         w["top"] >= marker["top"] - 20 and w["top"] - marker["top"] <= 150
@@ -342,13 +386,39 @@ def _extract_mrp(words: list[dict], lines: list[list[dict]]) -> dict:
         return _result(None, UNCERTAIN, marker_words, "MRP marker found, but no nearby reliable price was detected; no price was invented.")
     def price_rank(price: dict) -> tuple[float, float]:
         _, line = _line_for_word(lines, price)
-        unit_price = bool(re.search(r"\bper\s*(?:g|kg|ml|l)\b|/\s*(?:g|kg|ml|l)\b", _line_text(line), re.I))
         distance = min(_distance(price, marker) for marker in marker_words)
-        return (500.0 if unit_price else 0.0, distance)
-    price = min(candidates, key=price_rank)
+        return (500.0 if _is_unit_price(price, line) else 0.0, distance)
+    non_unit_candidates = [price for price in candidates if price_rank(price)[0] == 0]
+    if not non_unit_candidates:
+        return _result(None, UNCERTAIN, marker_words,
+                       "MRP marker found, but nearby values are unit prices; no legal MRP value was invented.")
+    price = min(non_unit_candidates, key=price_rank)
     marker = min(marker_words, key=lambda word: _distance(word, price))
     return _result(price["text"].strip(), FOUND, [marker, price],
                    "Associated an MRP marker variant with the nearest nearby decimal price after excluding unit-price context.")
+
+
+def _valid_date(value: str) -> bool:
+    numeric = re.fullmatch(r"(\d{1,2})[/-](\d{1,2})[/-](\d{2,4})", value)
+    if numeric:
+        day, month = int(numeric.group(1)), int(numeric.group(2))
+        return 1 <= day <= 31 and 1 <= month <= 12
+    month_year = re.fullmatch(r"(\d{1,2})[/-](\d{2,4})", value)
+    if month_year:
+        return 1 <= int(month_year.group(1)) <= 12
+    return True
+
+
+def _date_markers(lines: list[list[dict]]) -> list[dict]:
+    markers = []
+    for line in lines:
+        for match in DATE_MARKER_RE.finditer(_line_text(line)):
+            markers.extend(_matching_words(line, match))
+    return markers
+
+
+def _is_full_numeric_date(value: str) -> bool:
+    return bool(re.fullmatch(r"\d{1,2}[/-]\d{1,2}[/-]\d{2,4}", value))
 
 
 def _extract_date(words: list[dict], lines: list[list[dict]]) -> dict:
@@ -357,17 +427,11 @@ def _extract_date(words: list[dict], lines: list[list[dict]]) -> dict:
         text = _line_text(line)
         for match in DATE_RE.finditer(text):
             value = match.group(0)
-            numeric = re.fullmatch(r"(\d{1,2})[/-](\d{1,2})[/-](\d{2,4})", value)
-            if numeric and not (1 <= int(numeric.group(2)) <= 12):
-                continue
-            matches.append((value, _matching_words(line, match)))
+            evidence = _matching_words(line, match)
+            if _valid_date(value):
+                matches.append((value, evidence))
+    marker_evidence = _date_markers(lines)
     if not matches:
-        marker_evidence = []
-        for line in lines:
-            text = _line_text(line)
-            marker = DATE_MARKER_RE.search(text)
-            if marker:
-                marker_evidence.extend(_matching_words(line, marker))
         if not marker_evidence:
             date_words = [word for word in words if _clean(word["text"]).startswith("date")]
             packing_words = [word for word in words if _clean(word["text"]) in
@@ -380,8 +444,22 @@ def _extract_date(words: list[dict], lines: list[list[dict]]) -> dict:
             return _result(None, UNCERTAIN, marker_evidence,
                            "A packing/manufacture-date marker was detected, but no reliable date value was recovered; no date was reconstructed.")
         return _empty("No supported date or packing/manufacture-date marker was detected.")
-    value, evidence = max(matches, key=lambda item: len(item[0]))
-    return _result(value, FOUND, evidence, "Selected the longest supported date match to preserve the complete date.")
+    def date_rank(candidate: tuple[str, list[dict]]) -> tuple[int, float, float, int]:
+        value, evidence = candidate
+        confidence = _confidence(evidence)
+        distance = _marker_distance(evidence, [marker_evidence]) if marker_evidence else float("inf")
+        reliable = confidence >= 70 and (distance <= 220 or _is_full_numeric_date(value))
+        return (1 if reliable else 0, confidence, -distance, len(value))
+    value, evidence = max(matches, key=date_rank)
+    confidence = _confidence(evidence)
+    distance = _marker_distance(evidence, [marker_evidence]) if marker_evidence else float("inf")
+    combined_evidence = sorted({id(word): word for word in evidence + marker_evidence}.values(),
+                               key=lambda word: (word["top"], word["left"]))
+    if confidence >= 70 and (distance <= 220 or _is_full_numeric_date(value)):
+        return _result(value, FOUND, combined_evidence,
+                       "Selected a calendar-valid date with reliable OCR confidence and packing/manufacture context, or a complete supported numeric date declaration.")
+    return _result(None, UNCERTAIN, combined_evidence or evidence,
+                   "A date-like OCR fragment was found, but its confidence or packing/manufacture-marker proximity is insufficient; no date was accepted.")
 
 
 def _extract_consumer_care(words: list[dict], lines: list[list[dict]]) -> dict:
