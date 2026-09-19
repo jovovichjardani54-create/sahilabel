@@ -101,6 +101,10 @@ class HistoryStore:
             reviewer_status = report.get("reviewer_status")
         if product_name is None:
             product_name = report.get("product_name")
+        if not product_name:
+            # main.py does not pass product_name, so fall back to the value the
+            # extractor already recorded for the product-name declaration.
+            product_name = _extracted_product_name(report)
         product_name = str(product_name) if product_name else None
         created_at = created_at or datetime.now(timezone.utc).isoformat()
 
@@ -286,6 +290,24 @@ def _field_decision_summary(report: dict[str, Any]) -> dict[str, str]:
     }
 
 
+_MAX_PRODUCT_NAME_LENGTH = 200
+
+
+def _extracted_product_name(report: dict[str, Any]) -> str | None:
+    """Return the extractor's product-name text, if any, as a compact string."""
+    decisions = report.get("field_decisions")
+    if not isinstance(decisions, dict):
+        return None
+    decision = decisions.get("generic_product_name")
+    if not isinstance(decision, dict):
+        return None
+    value = decision.get("extracted_value")
+    if not isinstance(value, str):
+        return None
+    value = " ".join(value.split())
+    return value[:_MAX_PRODUCT_NAME_LENGTH] or None
+
+
 def _row_to_report(row: sqlite3.Row) -> dict[str, Any]:
     return {
         "product_session_id": row["product_session_id"],
@@ -342,6 +364,11 @@ def _report_select() -> str:
     )
 
 
+def _escape_like(text: str) -> str:
+    """Make user text match literally inside a LIKE pattern."""
+    return text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
 def _report_filters(
     query: str | None,
     overall_result: str | None,
@@ -352,10 +379,11 @@ def _report_filters(
     parameters: list[Any] = []
     if query:
         clauses.append(
-            "(filename LIKE ? COLLATE NOCASE OR product_name LIKE ? COLLATE NOCASE "
-            "OR product_session_id LIKE ? COLLATE NOCASE)"
+            "(filename LIKE ? ESCAPE '\\' COLLATE NOCASE "
+            "OR product_name LIKE ? ESCAPE '\\' COLLATE NOCASE "
+            "OR product_session_id LIKE ? ESCAPE '\\' COLLATE NOCASE)"
         )
-        query_text = f"%{query}%"
+        query_text = f"%{_escape_like(str(query))}%"
         parameters.extend((query_text, query_text, query_text))
     if overall_result:
         clauses.append("overall_result = ? COLLATE NOCASE")
