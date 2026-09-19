@@ -8,6 +8,7 @@ from inspector_review import (
     create_inspector_review,
     create_pending_review,
     get_review_status,
+    list_pending_reviews,
     override_review,
     requires_human_inspection,
 )
@@ -234,6 +235,114 @@ class InspectorReviewTests(unittest.TestCase):
         violation = create_pending_review("item-fail", "VIOLATION", inspector_id="insp-9", reviewer_name="Jay")
         self.assertFalse(violation["review_required"])
         self.assertFalse(get_review_status("item-fail")["found"])
+
+    def test_listing_pending_reviews(self):
+        create_pending_review("list-1", "REVIEW", inspector_id="insp-a", reviewer_name="Ana")
+        create_pending_review("list-2", {"status": "REVIEW"}, inspector_id="insp-b", reviewer_name="Bo")
+        create_pending_review("list-pass", "PASS", inspector_id="insp-a", reviewer_name="Ana")
+        confirm_review("list-2", inspector_id="insp-b", reviewer_name="Bo")
+        pending = list_pending_reviews()
+        review_ids = {item["review_id"] for item in pending}
+        self.assertEqual({"list-1"}, review_ids)
+        self.assertTrue(all(item["inspector_decision"] == "PENDING" for item in pending))
+        self.assertTrue(all(item["decision_support_only"] for item in pending))
+        self.assertTrue(all(not item["is_final_legal_decision"] for item in pending))
+
+    def test_reviewer_identity_capture(self):
+        created = create_pending_review(
+            "ident-1",
+            {"status": "REVIEW"},
+            inspector_id="insp-44",
+            reviewer_name="Meera",
+        )
+        self.assertEqual("insp-44", created["inspector_id"])
+        self.assertEqual("Meera", created["reviewer_name"])
+        confirmed = confirm_review(
+            "ident-1",
+            inspector_id="insp-99",
+            reviewer_name="Kiran",
+            reason="Checked against physical pack",
+        )
+        self.assertEqual("insp-99", confirmed["inspector_id"])
+        self.assertEqual("Kiran", confirmed["reviewer_name"])
+        self.assertEqual("insp-99", confirmed["audit_trail"][-1]["inspector_id"])
+        self.assertEqual("Kiran", confirmed["audit_trail"][-1]["reviewer_name"])
+
+    def test_field_level_confirmations(self):
+        create_pending_review("fields-1", "REVIEW", inspector_id="insp-f", reviewer_name="Ria")
+        confirmed = confirm_review(
+            "fields-1",
+            inspector_id="insp-f",
+            reviewer_name="Ria",
+            field_confirmations={"mrp": True, "net_quantity": False},
+        )
+        self.assertEqual({"mrp": True, "net_quantity": False}, confirmed["field_confirmations"])
+        self.assertEqual(
+            {"mrp": True, "net_quantity": False},
+            confirmed["audit_trail"][-1]["field_confirmations"],
+        )
+
+    def test_invalid_unsafe_transitions(self):
+        create_pending_review("unsafe-1", "REVIEW", inspector_id="insp-u", reviewer_name="Ned")
+        confirm_review("unsafe-1", inspector_id="insp-u", reviewer_name="Ned")
+        with self.assertRaisesRegex(InspectorReviewError, "already confirmed"):
+            override_review(
+                "unsafe-1",
+                inspector_id="insp-u",
+                reviewer_name="Ned",
+                reason="Trying to change a completed confirmation",
+            )
+        create_pending_review("unsafe-2", "REVIEW", inspector_id="insp-u", reviewer_name="Ned")
+        override_review(
+            "unsafe-2",
+            inspector_id="insp-u",
+            reviewer_name="Ned",
+            reason="Physical pack is compliant",
+        )
+        with self.assertRaisesRegex(InspectorReviewError, "already overridden"):
+            confirm_review("unsafe-2", inspector_id="insp-u", reviewer_name="Ned")
+        with self.assertRaisesRegex(InspectorReviewError, "already exists"):
+            create_pending_review("unsafe-1", "REVIEW", inspector_id="insp-u", reviewer_name="Ned")
+        confirmed = get_review_status("unsafe-1")
+        self.assertEqual("CONFIRMED", confirmed["inspector_decision"])
+        self.assertEqual("REVIEW", confirmed["automated_decision"])
+
+    def test_double_completion_prevention(self):
+        create_pending_review("once-1", "REVIEW", inspector_id="insp-d", reviewer_name="Dev")
+        first = confirm_review("once-1", inspector_id="insp-d", reviewer_name="Dev")
+        second = confirm_review("once-1", inspector_id="insp-d", reviewer_name="Dev")
+        self.assertTrue(second["idempotent"])
+        self.assertEqual(first["audit_trail"], second["audit_trail"])
+        self.assertEqual(2, len(second["audit_trail"]))
+        self.assertEqual("CONFIRMED", second["inspector_decision"])
+        create_pending_review("once-2", "REVIEW", inspector_id="insp-d", reviewer_name="Dev")
+        override_review(
+            "once-2",
+            inspector_id="insp-d",
+            reviewer_name="Dev",
+            reason="Inner flap has the MRP",
+        )
+        with self.assertRaisesRegex(InspectorReviewError, "already completed"):
+            override_review(
+                "once-2",
+                inspector_id="insp-d",
+                reviewer_name="Dev",
+                reason="A second override must not replace the first",
+            )
+        status = get_review_status("once-2")
+        self.assertEqual("OVERRIDDEN", status["inspector_decision"])
+        self.assertEqual("Inner flap has the MRP", status["reason"])
+        self.assertEqual(2, len(status["audit_trail"]))
+
+    def test_pending_review_is_not_a_final_legal_decision(self):
+        pending = create_pending_review("legal-1", "REVIEW", inspector_id="insp-l", reviewer_name="Lea")
+        self.assertFalse(pending["is_final_legal_decision"])
+        self.assertTrue(pending["decision_support_only"])
+        self.assertIn("not a final legal decision", pending["legal_notice"])
+        confirmed = confirm_review("legal-1", inspector_id="insp-l", reviewer_name="Lea")
+        self.assertTrue(confirmed["is_final_legal_decision"])
+        self.assertFalse(confirmed["decision_support_only"])
+        self.assertEqual("REVIEW", confirmed["automated_decision"])
 
 
 if __name__ == "__main__":
