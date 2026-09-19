@@ -71,6 +71,19 @@ class FieldExtractorTests(unittest.TestCase):
         ))
         self.assertEqual(fields["generic_product_name"]["value"], "PISTACHIOS")
 
+    def test_multi_word_commodity_beats_flavour_term_in_title(self):
+        fields = extract_fields(words_from_lines(
+            [("CHOCOLATE", 96), ("ICE", 90), ("CREAM", 90)],
+        ))
+        self.assertEqual(fields["generic_product_name"]["value"], "ICE CREAM")
+        self.assertEqual(fields["generic_product_name"]["evidence_text"], "ICE CREAM")
+
+    def test_chocolate_remains_a_valid_single_word_commodity(self):
+        fields = extract_fields(words_from_lines(
+            [("CHOCOLATE", 96)],
+        ))
+        self.assertEqual(fields["generic_product_name"]["value"], "CHOCOLATE")
+
     def test_company_phrase_is_preferred_over_marker_verb(self):
         fields = extract_fields(words_from_lines(
             [("Packed", 90), ("and", 88), ("Marketed", 90), ("By", 91)],
@@ -128,6 +141,29 @@ class FieldExtractorTests(unittest.TestCase):
         ))
         self.assertEqual(fields["manufacture_or_packing_date"]["status"], UNCERTAIN)
         self.assertIsNone(fields["manufacture_or_packing_date"]["value"])
+
+    def test_low_confidence_unmarked_month_year_is_not_accepted(self):
+        fields = extract_fields(words_from_lines(
+            [("04-33", 33)],
+        ))
+        self.assertEqual(fields["manufacture_or_packing_date"]["status"], UNCERTAIN)
+        self.assertIsNone(fields["manufacture_or_packing_date"]["value"])
+
+    def test_reliable_marker_backed_month_year_is_supported(self):
+        fields = extract_fields(words_from_lines(
+            [("MFD", 92), ("04/2024", 94)],
+        ))
+        self.assertEqual(fields["manufacture_or_packing_date"]["status"], FOUND)
+        self.assertEqual(fields["manufacture_or_packing_date"]["value"], "04/2024")
+
+    def test_currency_price_without_mrp_marker_is_uncertain_and_excludes_unit_price(self):
+        fields = extract_fields(words_from_lines(
+            [("₹300.00", 96), ("₹0.40", 96), ("/", 96), ("ml", 96)],
+        ))
+        mrp = fields["mrp"]
+        self.assertEqual(mrp["status"], UNCERTAIN)
+        self.assertEqual(mrp["value"], "₹300.00")
+        self.assertNotIn("₹0.40", mrp["evidence_text"])
 
     def test_consumer_care_can_use_contiguous_digit_fragments(self):
         fields = extract_fields(words_from_lines(
