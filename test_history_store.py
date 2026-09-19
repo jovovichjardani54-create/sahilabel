@@ -185,6 +185,75 @@ class HistoryStoreTests(unittest.TestCase):
         self.assertEqual(upgraded_store.get_report_summary("legacy")["filename"], "legacy.png")
         self.assertIsNone(upgraded_store.get_report_summary("legacy")["product_name"])
 
+    def test_product_name_is_derived_from_extracted_declaration(self):
+        extracted = {
+            "overall_result": "PASS",
+            "field_decisions": {
+                "generic_product_name": {
+                    "status": "PASS", "extracted_value": "  Masala   Tea \n Premium ",
+                },
+            },
+        }
+        saved = self.store.save_report("derived-1", "tea.png", extracted)
+
+        self.assertEqual(saved["product_name"], "Masala Tea Premium")
+        self.assertEqual(
+            [item["product_session_id"] for item in self.store.list_reports(query="masala")],
+            ["derived-1"],
+        )
+        # Only the compact status is kept, never the extracted evidence.
+        self.assertEqual(saved["field_decision_summary"], {"generic_product_name": "PASS"})
+
+    def test_explicit_product_name_takes_precedence_over_derived_name(self):
+        extracted = {
+            "overall_result": "PASS",
+            "field_decisions": {
+                "generic_product_name": {"status": "PASS", "extracted_value": "OCR Guess"},
+            },
+        }
+        explicit = self.store.save_report("explicit", "a.png", extracted, product_name="Chosen Name")
+        from_report = self.store.save_report(
+            "in-report", "b.png", {**extracted, "product_name": "Report Name"}
+        )
+
+        self.assertEqual(explicit["product_name"], "Chosen Name")
+        self.assertEqual(from_report["product_name"], "Report Name")
+
+    def test_missing_or_unusable_extracted_product_name_stays_empty(self):
+        for index, decision in enumerate(
+            [{"status": "REVIEW", "extracted_value": None},
+             {"status": "REVIEW", "extracted_value": "   "},
+             {"status": "REVIEW", "extracted_value": 12345},
+             {"status": "REVIEW"}, "not-a-dict"]
+        ):
+            saved = self.store.save_report(
+                f"unusable-{index}", "x.png",
+                {"overall_result": "REVIEW", "field_decisions": {"generic_product_name": decision}},
+            )
+            self.assertIsNone(saved["product_name"], decision)
+
+    def test_derived_product_name_is_length_limited(self):
+        saved = self.store.save_report(
+            "long", "long.png",
+            {"overall_result": "REVIEW", "field_decisions": {
+                "generic_product_name": {"status": "REVIEW", "extracted_value": "A" * 5000},
+            }},
+        )
+        self.assertEqual(len(saved["product_name"]), 200)
+
+    def test_search_treats_like_wildcards_as_literal_text(self):
+        for session_id, filename in [("a1", "tea.png"), ("a2", "100%_pure.png"), ("a3", "back\\slash.png")]:
+            self.store.save_report(session_id, filename, report("PASS"))
+
+        for query, expected in [
+            ("%", ["a2"]), ("_", ["a2"]), ("100%_", ["a2"]), ("a_", []),
+            ("\\", ["a3"]), ("TEA", ["a1"]),
+        ]:
+            with self.subTest(query=query):
+                found = sorted(item["product_session_id"] for item in self.store.list_reports(query=query))
+                self.assertEqual(found, expected)
+                self.assertEqual(self.store.count_reports(query=query), len(expected))
+
 
 if __name__ == "__main__":
     unittest.main()
