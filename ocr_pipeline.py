@@ -18,6 +18,8 @@ import pytesseract
 import cv2
 import numpy as np
 
+from quality_gate import assess_image_quality
+
 pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
 
 
@@ -252,6 +254,12 @@ def extract_text(image_path: str, use_preprocessing: bool = False) -> dict:
             ]
         }
     """
+    # Assess the original uploaded file before any OCR-specific image opening
+    # or transformation. Review is advisory: no text is inferred as absent.
+    quality = assess_image_quality(image_path)
+    if quality["recommendation"] != "PROCEED":
+        return {"full_text": "", "words": []}
+
     # Retain the public argument for compatibility. Both passes deliberately
     # avoid adaptive thresholding so coloured labels keep their faint text.
     original_image = Image.open(image_path)
