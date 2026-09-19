@@ -20,6 +20,27 @@ REVIEW = "REVIEW"
 
 ImageInput = Union[str, Path, np.ndarray]
 
+# Keep advisory quality thresholds in one place so they can be calibrated
+# without changing the decision flow.
+MIN_DIMENSION_POOR = 400
+MIN_PIXELS_POOR = 300_000
+MIN_DIMENSION_WARNING = 800
+MIN_PIXELS_WARNING = 1_000_000
+
+BLUR_POOR = 35.0
+BLUR_WARNING = 80.0
+
+DARK_MEAN_POOR = 50.0
+DARK_MEAN_WARNING = 75.0
+BRIGHT_MEAN_WARNING = 215.0
+BRIGHT_MEAN_POOR = 235.0
+
+GLARE_FRACTION_WARNING = 0.03
+GLARE_FRACTION_POOR = 0.12
+
+CONTRAST_POOR = 12.0
+CONTRAST_WARNING = 20.0
+
 
 def _check(status: str, score: float, value: dict[str, Any], explanation: str) -> dict[str, Any]:
     return {"status": status, "score": round(float(np.clip(score, 0, 100)), 1),
@@ -49,9 +70,9 @@ def _grayscale(image: ImageInput) -> np.ndarray:
 def _resolution(height: int, width: int) -> dict[str, Any]:
     pixels = height * width
     value = {"width": width, "height": height, "megapixels": round(pixels / 1_000_000, 2)}
-    if min(width, height) < 400 or pixels < 300_000:
+    if min(width, height) < MIN_DIMENSION_POOR or pixels < MIN_PIXELS_POOR:
         return _check(POOR, 20, value, "Resolution is too low to reliably read a label.")
-    if min(width, height) < 800 or pixels < 1_000_000:
+    if min(width, height) < MIN_DIMENSION_WARNING or pixels < MIN_PIXELS_WARNING:
         return _check(WARNING, 65, value, "Resolution may be inadequate for small label text.")
     return _check(GOOD, 100, value, "Resolution is suitable for label reading.")
 
@@ -59,33 +80,33 @@ def _resolution(height: int, width: int) -> dict[str, Any]:
 def _blur(gray: np.ndarray) -> dict[str, Any]:
     variance = float(cv2.Laplacian(gray, cv2.CV_64F).var())
     value = {"laplacian_variance": round(variance, 1)}
-    if variance < 35:
-        return _check(POOR, variance * 40 / 35, value, "Image is very blurry and text is unlikely to be reliable.")
-    if variance < 80:
-        return _check(WARNING, 55 + (variance - 35) * 25 / 45, value, "Image is somewhat blurry; inspect label text manually.")
+    if variance < BLUR_POOR:
+        return _check(POOR, variance * 40 / BLUR_POOR, value, "Image is very blurry and text is unlikely to be reliable.")
+    if variance < BLUR_WARNING:
+        return _check(WARNING, 55 + (variance - BLUR_POOR) * 25 / (BLUR_WARNING - BLUR_POOR), value, "Image is somewhat blurry; inspect label text manually.")
     return _check(GOOD, min(100, 80 + variance / 20), value, "Image sharpness is suitable for label text.")
 
 
 def _brightness(gray: np.ndarray) -> dict[str, Any]:
     mean = float(gray.mean())
     value = {"mean_intensity": round(mean, 1)}
-    if mean < 50:
-        return _check(POOR, mean * 40 / 50, value, "Image is too dark to read reliably.")
-    if mean < 75:
-        return _check(WARNING, 55 + (mean - 50), value, "Image is dark; some text may be obscured.")
-    if mean > 235:
-        return _check(POOR, max(0, 40 - (mean - 235) * 5), value, "Image is severely overexposed.")
-    if mean > 215:
-        return _check(WARNING, 80 - (mean - 215), value, "Image is bright; inspect pale text carefully.")
+    if mean < DARK_MEAN_POOR:
+        return _check(POOR, mean * 40 / DARK_MEAN_POOR, value, "Image is too dark to read reliably.")
+    if mean < DARK_MEAN_WARNING:
+        return _check(WARNING, 55 + (mean - DARK_MEAN_POOR), value, "Image is dark; some text may be obscured.")
+    if mean > BRIGHT_MEAN_POOR:
+        return _check(POOR, max(0, 40 - (mean - BRIGHT_MEAN_POOR) * 5), value, "Image is severely overexposed.")
+    if mean > BRIGHT_MEAN_WARNING:
+        return _check(WARNING, 80 - (mean - BRIGHT_MEAN_WARNING), value, "Image is bright; inspect pale text carefully.")
     return _check(GOOD, 100, value, "Brightness is suitable for label reading.")
 
 
 def _glare(gray: np.ndarray) -> dict[str, Any]:
     near_white_fraction = float(np.mean(gray >= 250))
     value = {"near_white_fraction": round(near_white_fraction, 4)}
-    if near_white_fraction > 0.12:
+    if near_white_fraction > GLARE_FRACTION_POOR:
         return _check(POOR, 40 - near_white_fraction * 100, value, "Glare or overexposure obscures part of the image.")
-    if near_white_fraction > 0.03:
+    if near_white_fraction > GLARE_FRACTION_WARNING:
         return _check(WARNING, 80 - near_white_fraction * 200, value, "Glare may obscure label details.")
     return _check(GOOD, 100, value, "No significant glare or overexposure detected.")
 
@@ -95,11 +116,26 @@ def _readability(gray: np.ndarray, checks: dict[str, dict[str, Any]]) -> dict[st
     visual_score = float(np.mean([checks[name]["score"] for name in ("resolution", "blur", "brightness", "glare")]))
     score = min(100, contrast * 2 + visual_score * 0.45)
     value = {"contrast_stddev": round(contrast, 1)}
-    if contrast < 12 or visual_score < 50:
+    if contrast < CONTRAST_POOR or visual_score < 50:
         return _check(POOR, score, value, "The label is unlikely to be reliably readable.")
-    if contrast < 20 or visual_score < 75:
+    if contrast < CONTRAST_WARNING or visual_score < 75:
         return _check(WARNING, score, value, "Label readability is uncertain and needs human review.")
     return _check(GOOD, score, value, "The image is likely readable for label extraction.")
+
+
+def _unusable_assessment(reason: str) -> dict[str, Any]:
+    """Return an advisory REVIEW result for input that cannot be inspected."""
+    checks = {
+        name: _check(POOR, 0, {}, reason)
+        for name in ("resolution", "blur", "brightness", "glare", "readability")
+    }
+    return {
+        "quality_status": POOR,
+        "quality_score": 0.0,
+        "checks": checks,
+        "explanation": f"Image quality needs review: {reason}",
+        "recommendation": REVIEW,
+    }
 
 
 def assess_image_quality(image: ImageInput) -> dict[str, Any]:
@@ -108,7 +144,10 @@ def assess_image_quality(image: ImageInput) -> dict[str, Any]:
     Any WARNING or POOR result has a REVIEW recommendation. This module does
     not produce violations or call the OCR pipeline.
     """
-    gray = _grayscale(image)
+    try:
+        gray = _grayscale(image)
+    except (TypeError, ValueError, cv2.error) as error:
+        return _unusable_assessment(f"Image could not be assessed safely ({error}).")
     height, width = gray.shape
     checks = {
         "resolution": _resolution(height, width),

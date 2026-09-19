@@ -1,4 +1,7 @@
 import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
 import cv2
 import numpy as np
@@ -25,10 +28,22 @@ class ImageQualityGateTests(unittest.TestCase):
         self.assertNotEqual(result["checks"]["blur"]["status"], GOOD)
         self.assertEqual(result["recommendation"], REVIEW)
 
+    def test_borderline_blur_requires_review(self):
+        # The mocked Laplacian must have variance 50, not a constant value.
+        with patch("quality_gate.cv2.Laplacian", return_value=np.array([[0.0, 10.0], [10.0, 20.0]])):
+            result = assess_image_quality(readable_label())
+        self.assertEqual(result["checks"]["blur"]["status"], WARNING)
+        self.assertEqual(result["recommendation"], REVIEW)
+
     def test_tiny_image_is_poor(self):
         result = assess_image_quality(cv2.resize(readable_label(), (200, 150)))
         self.assertEqual(result["quality_status"], POOR)
         self.assertEqual(result["checks"]["resolution"]["status"], POOR)
+        self.assertEqual(result["recommendation"], REVIEW)
+
+    def test_borderline_resolution_requires_review(self):
+        result = assess_image_quality(readable_label(800, 800))
+        self.assertEqual(result["checks"]["resolution"]["status"], WARNING)
         self.assertEqual(result["recommendation"], REVIEW)
 
     def test_dark_image_is_poor(self):
@@ -44,6 +59,35 @@ class ImageQualityGateTests(unittest.TestCase):
         self.assertEqual(result["quality_status"], POOR)
         self.assertEqual(result["checks"]["glare"]["status"], POOR)
         self.assertEqual(result["recommendation"], REVIEW)
+
+    def test_glare_heavy_image_requires_review(self):
+        image = readable_label()
+        image[:600, :800] = 255
+        result = assess_image_quality(image)
+        self.assertIn(result["checks"]["glare"]["status"], (WARNING, POOR))
+        self.assertEqual(result["recommendation"], REVIEW)
+
+    def test_low_contrast_image_requires_review(self):
+        result = assess_image_quality(np.full((1200, 1600, 3), 150, dtype=np.uint8))
+        self.assertEqual(result["checks"]["readability"]["status"], POOR)
+        self.assertEqual(result["recommendation"], REVIEW)
+
+    def test_combined_poor_quality_image_requires_review(self):
+        result = assess_image_quality(np.full((150, 200, 3), 20, dtype=np.uint8))
+        self.assertEqual(result["quality_status"], POOR)
+        self.assertEqual(result["recommendation"], REVIEW)
+
+    def test_corrupt_image_is_reviewed_safely(self):
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "corrupt.jpg"
+            path.write_bytes(b"not an image")
+            result = assess_image_quality(path)
+        self.assertEqual(result["recommendation"], REVIEW)
+
+    def test_missing_and_invalid_images_are_reviewed_safely(self):
+        self.assertEqual(assess_image_quality("not-a-real-image.jpg")["recommendation"], REVIEW)
+        self.assertEqual(assess_image_quality(np.array([], dtype=np.uint8))["recommendation"], REVIEW)
+        self.assertEqual(assess_image_quality(np.zeros((20, 20, 2), dtype=np.uint8))["recommendation"], REVIEW)
 
 
 if __name__ == "__main__":
