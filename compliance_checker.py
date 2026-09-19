@@ -16,6 +16,8 @@ Produces a structured compliance report:
     }
 """
 
+from typing import Any, Mapping
+
 from field_extractor import FOUND, NOT_FOUND, UNCERTAIN, extract_fields
 from rules_config import MANDATORY_FIELDS
 
@@ -57,22 +59,35 @@ def _decision_for(extracted: dict, package_sides_complete: bool, ocr_quality_suf
     return "VIOLATION", "Potential violation pending inspector confirmation: declaration was not found after complete package coverage and sufficient OCR quality."
 
 
-def check_fields(ocr_result: dict, package_sides_complete: bool = False,
-                 ocr_quality_sufficient: bool | None = None) -> dict:
-    """Assess structured OCR evidence as decision support, not a legal finding."""
-    words = ocr_result.get("words", [])
-    quality = _has_sufficient_ocr_quality(ocr_result) if ocr_quality_sufficient is None else ocr_quality_sufficient
-    extracted_fields = extract_fields(ocr_result)
+def check_extracted_fields(
+    extracted_fields: Mapping[str, Mapping[str, Any]],
+    package_sides_complete: bool = False,
+    ocr_quality_sufficient: bool = False,
+    source_evidence: Mapping[str, Mapping[str, Any]] | None = None,
+    readability_words: list[dict] | tuple[dict, ...] = (),
+) -> dict:
+    """Assess already-extracted declarations without changing rule semantics.
+
+    ``source_evidence`` is optional provenance supplied by a caller that
+    extracted fields from more than one source image. It is returned alongside
+    each decision and is deliberately opaque to this checker: legal decisions
+    still depend only on the existing extraction status, coverage and OCR
+    quality inputs.
+    """
     decisions, legacy_fields = {}, {}
     for field_key, extracted in extracted_fields.items():
         legacy_key, rule_id = FIELD_MAPPING[field_key]
-        status, reason = _decision_for(extracted, package_sides_complete, quality)
+        status, reason = _decision_for(
+            extracted, package_sides_complete, ocr_quality_sufficient
+        )
         decisions[field_key] = {
             "field_key": field_key, "rule_id": rule_id, "status": status,
             "extracted_value": extracted["value"], "confidence": extracted["confidence"],
             "evidence_text": extracted["evidence_text"], "bbox": extracted["bbox"],
             "reason": reason,
         }
+        if source_evidence and field_key in source_evidence:
+            decisions[field_key]["source_evidence"] = dict(source_evidence[field_key])
         definition = MANDATORY_FIELDS[legacy_key]
         legacy_fields[legacy_key] = {
             "present": status == "PASS", "matched_text": extracted["value"],
@@ -81,7 +96,7 @@ def check_fields(ocr_result: dict, package_sides_complete: bool = False,
 
     statuses = [decision["status"] for decision in decisions.values()]
     overall_result = "VIOLATION" if "VIOLATION" in statuses else "REVIEW" if "REVIEW" in statuses else "PASS"
-    readability_flags = _check_readability(words)
+    readability_flags = _check_readability(list(readability_words))
     notes = ["Decision support only: any potential violation requires inspector confirmation."]
     if not package_sides_complete:
         notes.append("Package-side coverage is incomplete by default for the single-image workflow.")
@@ -93,6 +108,17 @@ def check_fields(ocr_result: dict, package_sides_complete: bool = False,
         "field_decisions": decisions, "fields": legacy_fields,
         "readability_flags": readability_flags, "notes": notes,
     }
+
+
+def check_fields(ocr_result: dict, package_sides_complete: bool = False,
+                 ocr_quality_sufficient: bool | None = None) -> dict:
+    """Assess structured OCR evidence as decision support, not a legal finding."""
+    words = ocr_result.get("words", [])
+    quality = _has_sufficient_ocr_quality(ocr_result) if ocr_quality_sufficient is None else ocr_quality_sufficient
+    return check_extracted_fields(
+        extract_fields(ocr_result), package_sides_complete, quality,
+        readability_words=words,
+    )
 
 
 OCR_CONFIDENCE_THRESHOLD = 70.0  # below this, treat as "hard to read"
